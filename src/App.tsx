@@ -16,6 +16,15 @@ const VAD = {
   RING_CIRC: 38,
 };
 
+/* ─── Sizes ─── */
+const SIZE_IDLE = { w: 48, h: 48 };
+const SIZE_PILL = { w: 260, h: 48 };
+const SIZE_TALL = { w: 260, h: 100 };
+
+/* ─── Timing ─── */
+const TRANSITION_MS = 420; // CSS pill spring transition duration + margin
+const SHOW_TRANSCRIPT_DELAY = 300;
+
 /**
  * Resize the window while keeping its visual center-x and bottom-y anchored.
  * This way, if the user drags the pill somewhere, expand/collapse happens
@@ -24,18 +33,15 @@ const VAD = {
 async function resizeInPlace(width: number, height: number) {
   const win = getCurrentWindow();
 
-  // Get current position + size so we can anchor around it
   const oldPos = await win.outerPosition();
   const oldSize = await win.outerSize();
   const factor = await win.scaleFactor();
 
-  // Convert physical → logical
   const oldW = oldSize.width / factor;
   const oldH = oldSize.height / factor;
   const oldX = oldPos.x / factor;
   const oldY = oldPos.y / factor;
 
-  // Anchor: keep center-x and bottom-y stable
   const centerX = oldX + oldW / 2;
   const bottomY = oldY + oldH;
 
@@ -52,6 +58,8 @@ function App() {
   const [modelReady, setModelReady] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState(0);
   const [isSpeaking, setIsSpeaking] = useState(false);
+  const [showTranscript, setShowTranscript] = useState(false);
+
   const stateRef = useRef<AppState>("idle");
   const modelReadyRef = useRef(false);
   const vadArcRef = useRef<SVGCircleElement>(null);
@@ -71,7 +79,7 @@ function App() {
     modelReadyRef.current = modelReady;
   }, [modelReady]);
 
-  // VAD processing — runs on analyserNode from requestAnimationFrame inside Waveform
+  // ─── VAD processing (runs each animation frame via Waveform onFrame) ───
   const processVAD = useCallback(() => {
     if (!analyserNode) return;
 
@@ -114,32 +122,45 @@ function App() {
     }
   }, [analyserNode]);
 
+  // ─── Toggle: idle → listening → processing → idle ───
   const handleToggle = useCallback(async () => {
     const currentState = stateRef.current;
 
     if (currentState === "idle" && modelReadyRef.current) {
-      setState("listening");
-      stateRef.current = "listening";
-
-      // Reset VAD state
+      // ── EXPAND: idle → listening ──
+      // Reset VAD
       silentFramesRef.current = 0;
       speechFramesRef.current = 0;
       isSpeakingRef.current = false;
       setIsSpeaking(false);
       setTranscript("");
+      setShowTranscript(false);
 
+      // 1. Resize window FIRST (so pill has room)
+      await resizeInPlace(SIZE_PILL.w, SIZE_PILL.h);
+
+      // 2. Apply CSS classes (pill animates to fill the space)
+      setState("listening");
+      stateRef.current = "listening";
+
+      // 3. Start audio capture
       await start();
 
-      // Expand pill
-      await resizeInPlace(260, 48);
-
-      // Show transcript row after a beat
+      // 4. After a beat, grow window to tall size and show transcript row
       setTimeout(async () => {
-        await resizeInPlace(260, 100);
-      }, 300);
+        // Only if still listening
+        if (stateRef.current === "listening") {
+          await resizeInPlace(SIZE_TALL.w, SIZE_TALL.h);
+          setShowTranscript(true);
+        }
+      }, SHOW_TRANSCRIPT_DELAY);
+
     } else if (currentState === "listening") {
+      // ── COLLAPSE: listening → processing → idle ──
+      // Switch to processing (pill stays expanded, inner content swaps via CSS)
       setState("processing");
       stateRef.current = "processing";
+
       const audioData = await stop();
 
       if (audioData && audioData.samples.length > 0) {
@@ -150,6 +171,7 @@ function App() {
           });
           if (result.trim()) {
             setTranscript(result.trim());
+            // Brief pause so user sees the result before typing
             await new Promise((r) => setTimeout(r, 400));
             await invoke("type_text", { text: result.trim() });
           }
@@ -159,36 +181,50 @@ function App() {
         }
       }
 
+      // ── Now collapse back to idle ──
+      // 1. Remove CSS classes first (pill animates to circle)
       setState("idle");
       stateRef.current = "idle";
+      setShowTranscript(false);
+      setIsSpeaking(false);
 
-      // Collapse pill back
-      await resizeInPlace(48, 48);
+      // 2. Wait for CSS transition to finish, THEN resize window
+      await new Promise((r) => setTimeout(r, TRANSITION_MS));
+      await resizeInPlace(SIZE_IDLE.w, SIZE_IDLE.h);
 
-      setTimeout(() => setTranscript(""), 3000);
+      // Clear old transcript after a moment
+      setTimeout(() => setTranscript(""), 2000);
     }
   }, [start, stop]);
 
+  // ─── Close button (cancel listening) ───
   const handleClose = useCallback(async () => {
     if (stateRef.current === "listening") {
+      await stop();
+
+      // 1. Remove CSS classes first
       setState("idle");
       stateRef.current = "idle";
-      await stop();
+      setShowTranscript(false);
+      setIsSpeaking(false);
       silentFramesRef.current = 0;
       speechFramesRef.current = 0;
       isSpeakingRef.current = false;
-      setIsSpeaking(false);
-      await resizeInPlace(48, 48);
-      setTimeout(() => setTranscript(""), 400);
+
+      // 2. Wait for CSS transition, then resize
+      await new Promise((r) => setTimeout(r, TRANSITION_MS));
+      await resizeInPlace(SIZE_IDLE.w, SIZE_IDLE.h);
+      setTranscript("");
     }
   }, [stop]);
 
+  // Keep toggle ref up to date for hotkey callback
   const toggleRef = useRef(handleToggle);
   useEffect(() => {
     toggleRef.current = handleToggle;
   }, [handleToggle]);
 
-  // Download model on mount
+  // ─── Download model on mount ───
   useEffect(() => {
     invoke<boolean>("is_model_ready")
       .then((ready) => {
@@ -210,7 +246,7 @@ function App() {
     };
   }, []);
 
-  // Register global shortcut once
+  // ─── Register global shortcut ───
   useEffect(() => {
     register("CommandOrControl+Shift+Space", (event: any) => {
       if (!event.state || event.state === "Pressed") {
@@ -223,66 +259,70 @@ function App() {
     };
   }, []);
 
-  // Build CSS classes for #pill
-  const pillClasses = [
-    state === "listening" ? "expanded listening" : "",
-    state === "processing" ? "expanded processing" : "",
-    state === "listening" && transcript ? "show-transcript" : "",
-    // Show transcript row after 300ms — handled by resize, but CSS class needed
-    state === "listening" ? "show-transcript" : "",
-    isSpeaking ? "vad-active" : "",
-  ]
-    .filter(Boolean)
-    .join(" ");
+  // ─── Build CSS classes for #pill ───
+  // All state-driven, no conditional rendering needed.
+  const pillClasses: string[] = [];
 
-  // Download progress as ring (circumference of r=11 circle ≈ 69.115)
+  if (!modelReady) {
+    pillClasses.push("downloading");
+  }
+  if (state === "listening") {
+    pillClasses.push("expanded", "listening");
+  }
+  if (state === "processing") {
+    pillClasses.push("expanded", "processing");
+  }
+  if (showTranscript && (state === "listening" || state === "processing")) {
+    pillClasses.push("show-transcript");
+  }
+  if (isSpeaking && state === "listening") {
+    pillClasses.push("vad-active");
+  }
+
+  // Download progress ring (circumference of r=11 circle ≈ 69.115)
   const downloadCircumference = 69.115;
   const downloadOffset = downloadCircumference * (1 - downloadProgress / 100);
 
   return (
-    <div id="pill" className={pillClasses} data-tauri-drag-region>
-      {/* Idle mic icon — shown when not downloading and idle */}
-      {modelReady && state === "idle" && (
-        <div className="mic-icon" data-tauri-drag-region>
-          <svg viewBox="0 0 18 18" fill="none" data-tauri-drag-region>
-            <rect x="6" y="1" width="6" height="10" rx="3" fill="var(--muted)" stroke="none" />
-            <path
-              d="M3 8a6 6 0 0 0 12 0"
-              stroke="var(--muted)"
-              strokeWidth="1.5"
-              strokeLinecap="round"
-              fill="none"
-            />
-            <line
-              x1="9" y1="14" x2="9" y2="17"
-              stroke="var(--muted)"
-              strokeWidth="1.5"
-              strokeLinecap="round"
-            />
-          </svg>
-        </div>
-      )}
+    <div id="pill" className={pillClasses.join(" ")} data-tauri-drag-region>
+      {/* ─── Mic icon — ALWAYS in DOM, CSS hides when downloading/expanded ─── */}
+      <div className="mic-icon" data-tauri-drag-region>
+        <svg viewBox="0 0 18 18" fill="none" data-tauri-drag-region>
+          <rect x="6" y="1" width="6" height="10" rx="3" fill="var(--muted)" stroke="none" />
+          <path
+            d="M3 8a6 6 0 0 0 12 0"
+            stroke="var(--muted)"
+            strokeWidth="1.5"
+            strokeLinecap="round"
+            fill="none"
+          />
+          <line
+            x1="9" y1="14" x2="9" y2="17"
+            stroke="var(--muted)"
+            strokeWidth="1.5"
+            strokeLinecap="round"
+          />
+        </svg>
+      </div>
 
-      {/* Download progress ring — shown when model not ready */}
-      {!modelReady && (
-        <div className="download-bar" data-tauri-drag-region>
-          <svg viewBox="0 0 28 28" data-tauri-drag-region>
-            <circle className="download-ring-bg" cx="14" cy="14" r="11" />
-            <circle
-              className="download-ring-fg"
-              cx="14"
-              cy="14"
-              r="11"
-              style={{ strokeDashoffset: downloadOffset }}
-            />
-            <text className="download-pct" x="14" y="14">
-              {Math.round(downloadProgress)}%
-            </text>
-          </svg>
-        </div>
-      )}
+      {/* ─── Download ring — ALWAYS in DOM, CSS shows only when .downloading ─── */}
+      <div className="download-bar" data-tauri-drag-region>
+        <svg viewBox="0 0 28 28" data-tauri-drag-region>
+          <circle className="download-ring-bg" cx="14" cy="14" r="11" />
+          <circle
+            className="download-ring-fg"
+            cx="14"
+            cy="14"
+            r="11"
+            style={{ strokeDashoffset: downloadOffset }}
+          />
+          <text className="download-pct" x="14" y="14">
+            {Math.round(downloadProgress)}%
+          </text>
+        </svg>
+      </div>
 
-      {/* Expanded inner row */}
+      {/* ─── Inner row — ALWAYS in DOM, CSS shows when .expanded ─── */}
       <div className="inner-row" data-tauri-drag-region>
         <div className="canvas-wrap" data-tauri-drag-region>
           <Waveform analyserNode={analyserNode} onFrame={processVAD} />
@@ -305,7 +345,13 @@ function App() {
         </button>
       </div>
 
-      {/* Transcript row */}
+      {/* ─── Processing overlay — ALWAYS in DOM, CSS fades in when .processing ─── */}
+      <div className="processing-overlay" data-tauri-drag-region>
+        <div className="spinner" data-tauri-drag-region />
+        <span className="processing-text" data-tauri-drag-region>...</span>
+      </div>
+
+      {/* ─── Transcript row — ALWAYS in DOM, CSS shows when .show-transcript ─── */}
       <div className="transcript-row" data-tauri-drag-region>
         <div className="tx" data-tauri-drag-region>
           {state === "processing" ? (
@@ -317,14 +363,6 @@ function App() {
           )}
         </div>
       </div>
-
-      {/* Processing spinner overlay (shown on pill when processing) */}
-      {state === "processing" && (
-        <div className="processing-overlay" data-tauri-drag-region>
-          <div className="spinner" data-tauri-drag-region />
-          <span className="processing-text" data-tauri-drag-region>...</span>
-        </div>
-      )}
     </div>
   );
 }
