@@ -1,0 +1,31 @@
+[package]
+name = "v-voice-claude"
+version = "0.1.0"
+description = "Voice to text floating widget"
+authors = ["you"]
+edition = "2021"
+
+[lib]
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-global-shortcut = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hound = "3.5"
+zip = "2"
+enigo = { version = "0.2", features = [] }
+reqwest = { version = "0.12", features = ["stream"] }
+tokio = { version = "1", features = ["fs", "sync", "process"] }
+dirs = "6"
+futures-util = "0.3"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

@@ -1,0 +1,372 @@
+@import "tailwindcss";
+
+:root {
+  --bg: rgba(12, 12, 16, 0.94);
+  --border: rgba(255, 255, 255, 0.10);
+  --accent: #7DF9C4;
+  --accent2: #A78BFA;
+  --warn: #FFB547;
+  --text: #F0EEF8;
+  --muted: rgba(240, 238, 248, 0.38);
+  --danger: #FF6B8A;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: transparent;
+  font-family: 'JetBrains Mono', monospace;
+  color: var(--text);
+  -webkit-user-select: none;
+  user-select: none;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding-bottom: 0;
+}
+
+/* ── PILL (idle state) ── */
+#pill {
+  position: relative;
+  width: 48px;
+  height: 48px;
+  border-radius: 24px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  backdrop-filter: blur(24px) saturate(200%);
+  -webkit-backdrop-filter: blur(24px) saturate(200%);
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.07);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  transition:
+    width 0.4s cubic-bezier(0.34, 1.56, 0.64, 1),
+    height 0.4s cubic-bezier(0.34, 1.56, 0.64, 1),
+    border-radius 0.4s cubic-bezier(0.34, 1.56, 0.64, 1),
+    box-shadow 0.3s ease;
+  cursor: grab;
+}
+
+#pill:active {
+  cursor: grabbing;
+}
+
+#pill.expanded {
+  width: 260px;
+  height: 48px;
+  border-radius: 24px;
+}
+
+#pill.show-transcript {
+  height: 96px;
+  border-radius: 16px;
+}
+
+/* Glow ring */
+#pill::before {
+  content: '';
+  position: absolute;
+  inset: -2px;
+  border-radius: inherit;
+  background: conic-gradient(from 0deg, var(--accent), var(--accent2), var(--accent));
+  opacity: 0;
+  z-index: -1;
+  transition: opacity 0.3s ease;
+  filter: blur(8px);
+  animation: spin-glow 3s linear infinite;
+}
+
+#pill.listening::before {
+  opacity: 0.35;
+}
+
+#pill.vad-active::before {
+  opacity: 0.7;
+}
+
+@keyframes spin-glow {
+  to { filter: blur(8px) hue-rotate(360deg); }
+}
+
+/* Noise texture overlay */
+#pill::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.04'/%3E%3C/svg%3E");
+  pointer-events: none;
+}
+
+/* ── MIC ICON (idle) ── */
+.mic-icon {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 48px;
+  height: 48px;
+  transition: opacity 0.2s ease, transform 0.2s ease;
+  z-index: 2;
+}
+
+.mic-icon svg {
+  width: 18px;
+  height: 18px;
+}
+
+#pill.expanded .mic-icon {
+  opacity: 0;
+  transform: scale(0.6);
+  pointer-events: none;
+}
+
+/* ── INNER ROW (expanded) ── */
+.inner-row {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  padding: 0 10px 0 14px;
+  gap: 8px;
+  opacity: 0;
+  transition: opacity 0.2s ease 0.1s;
+  pointer-events: none;
+}
+
+#pill.expanded .inner-row {
+  opacity: 1;
+  pointer-events: all;
+}
+
+/* Canvas waveform */
+.canvas-wrap {
+  flex: 1;
+  height: 32px;
+  position: relative;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.canvas-wrap canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+/* Idle mini-bars inside canvas when just opened */
+.idle-bars {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  transition: opacity 0.2s ease;
+}
+
+.ibar {
+  width: 2px;
+  border-radius: 1px;
+  background: var(--muted);
+  animation: ibar-breathe 1.4s ease-in-out infinite;
+}
+
+.ibar:nth-child(1) { height: 6px; animation-delay: 0s; }
+.ibar:nth-child(2) { height: 10px; animation-delay: 0.15s; }
+.ibar:nth-child(3) { height: 14px; animation-delay: 0.3s; }
+.ibar:nth-child(4) { height: 10px; animation-delay: 0.45s; }
+.ibar:nth-child(5) { height: 6px; animation-delay: 0.6s; }
+
+@keyframes ibar-breathe {
+  0%, 100% { transform: scaleY(0.6); opacity: 0.25; }
+  50% { transform: scaleY(1); opacity: 0.6; }
+}
+
+#pill.vad-active .idle-bars,
+#pill.listening .idle-bars {
+  opacity: 0;
+}
+
+/* VAD ring */
+.vad-ring {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+
+#pill.listening .vad-ring {
+  opacity: 1;
+}
+
+.vad-ring circle {
+  fill: none;
+  stroke-width: 2;
+  transform-origin: 50% 50%;
+  transform: rotate(-90deg);
+}
+
+.vad-ring .vad-bg {
+  stroke: rgba(255, 255, 255, 0.08);
+}
+
+.vad-ring .vad-fg {
+  stroke: var(--accent);
+  stroke-dasharray: 38;
+  stroke-dashoffset: 38;
+  transition: stroke-dashoffset 0.08s linear, stroke 0.2s ease;
+  stroke-linecap: round;
+}
+
+#pill.vad-active .vad-ring .vad-fg {
+  stroke: var(--accent2);
+}
+
+/* Close button */
+.close-btn {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: none;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--muted);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  line-height: 1;
+  transition: background 0.15s;
+  flex-shrink: 0;
+}
+
+.close-btn:hover {
+  background: var(--danger);
+  color: #fff;
+}
+
+/* ── TRANSCRIPT ROW ── */
+.transcript-row {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 52px;
+  padding: 0 14px 10px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s ease 0.15s;
+  max-height: 40px;
+  overflow: hidden;
+}
+
+#pill.show-transcript .transcript-row {
+  opacity: 1;
+  pointer-events: all;
+}
+
+.tx {
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--muted);
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  padding-top: 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tx-pending {
+  color: var(--warn);
+}
+
+.tx-interim {
+  color: rgba(240, 238, 248, 0.2);
+  font-style: italic;
+}
+
+/* ── DOWNLOAD PROGRESS ── */
+.download-bar {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 48px;
+  height: 48px;
+  z-index: 2;
+}
+
+.download-bar svg {
+  width: 28px;
+  height: 28px;
+}
+
+.download-ring-bg {
+  fill: none;
+  stroke: rgba(255, 255, 255, 0.08);
+  stroke-width: 2.5;
+}
+
+.download-ring-fg {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 2.5;
+  stroke-linecap: round;
+  stroke-dasharray: 69.115;
+  stroke-dashoffset: 69.115;
+  transform-origin: 50% 50%;
+  transform: rotate(-90deg);
+  transition: stroke-dashoffset 0.3s ease;
+}
+
+.download-pct {
+  font-size: 7px;
+  fill: var(--muted);
+  text-anchor: middle;
+  dominant-baseline: central;
+  font-family: 'JetBrains Mono', monospace;
+  font-weight: 500;
+}
+
+/* ── PROCESSING SPINNER ── */
+.processing-overlay {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  z-index: 2;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+
+#pill.processing .processing-overlay {
+  opacity: 1;
+}
+
+.spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--warn);
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.processing-text {
+  font-size: 10px;
+  color: var(--warn);
+}
