@@ -240,6 +240,14 @@ pub async fn transcribe_audio(
         cmd.arg("-l").arg(language);
     }
 
+    // Vietnamese-specific: provide an initial prompt to help Whisper
+    // produce properly accented Vietnamese text with diacritics
+    if language == "vi" {
+        cmd.arg("--prompt").arg(
+            "Xin chào, đây là bản ghi âm tiếng Việt. Hãy chuyển đổi chính xác với dấu thanh đầy đủ."
+        );
+    }
+
     cmd.arg("--no-prints");
 
     let output = cmd
@@ -253,6 +261,95 @@ pub async fn transcribe_audio(
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("whisper-cli failed: {}", stderr));
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    Ok(text.trim().to_string())
+}
+
+/// Transcribe audio partially (for real-time streaming preview).
+/// Uses a separate temp file so it doesn't conflict with the final transcription.
+pub async fn transcribe_partial(
+    samples: Vec<f32>,
+    sample_rate: u32,
+    model_id: &str,
+    language: &str,
+) -> Result<String, String> {
+    let model = model_path(model_id);
+    let cli = cli_path();
+
+    if !model.exists() || !cli.exists() {
+        return Err("Model or CLI not ready".to_string());
+    }
+
+    // Resample to 16kHz if needed
+    let audio_data = if sample_rate != WHISPER_SAMPLE_RATE {
+        resample(&samples, sample_rate, WHISPER_SAMPLE_RATE)
+    } else {
+        samples
+    };
+
+    // Use a separate temp file for partial transcriptions
+    let temp_dir = std::env::temp_dir();
+    let wav_path = temp_dir.join("v-voice-claude-partial.wav");
+
+    let wav_path_clone = wav_path.clone();
+    tokio::task::spawn_blocking(move || {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: WHISPER_SAMPLE_RATE,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&wav_path_clone, spec)
+            .map_err(|e| format!("Failed to create partial WAV: {}", e))?;
+
+        for &sample in &audio_data {
+            let s = (sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
+            writer
+                .write_sample(s)
+                .map_err(|e| format!("Failed to write WAV sample: {}", e))?;
+        }
+        writer
+            .finalize()
+            .map_err(|e| format!("Failed to finalize WAV: {}", e))?;
+
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|e| format!("WAV write task error: {}", e))??;
+
+    let cli_str = cli.to_str().unwrap();
+    let model_str = model.to_str().unwrap();
+    let wav_str = wav_path.to_str().unwrap();
+
+    let mut cmd = tokio::process::Command::new(cli_str);
+    cmd.arg("-m").arg(model_str);
+    cmd.arg("-f").arg(wav_str);
+    cmd.arg("--no-timestamps");
+
+    if language != "auto" {
+        cmd.arg("-l").arg(language);
+    }
+
+    if language == "vi" {
+        cmd.arg("--prompt").arg(
+            "Xin chào, đây là bản ghi âm tiếng Việt. Hãy chuyển đổi chính xác với dấu thanh đầy đủ."
+        );
+    }
+
+    cmd.arg("--no-prints");
+
+    let output = cmd
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run whisper-cli: {}", e))?;
+
+    let _ = tokio::fs::remove_file(&wav_path).await;
+
+    if !output.status.success() {
+        // For partial, just return empty on error (don't break the UI)
+        return Ok(String::new());
     }
 
     let text = String::from_utf8_lossy(&output.stdout);

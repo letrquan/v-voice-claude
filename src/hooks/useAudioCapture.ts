@@ -74,6 +74,27 @@ export function useAudioCapture() {
     }
   }, []);
 
+  /** Get a snapshot of the accumulated audio buffer without stopping recording. */
+  const getBuffer = useCallback((): AudioData | null => {
+    if (!audioContextRef.current || samplesRef.current.length === 0) return null;
+
+    const sampleRate = audioContextRef.current.sampleRate;
+    const totalLength = samplesRef.current.reduce(
+      (sum, chunk) => sum + chunk.length,
+      0
+    );
+    if (totalLength === 0) return null;
+
+    const allSamples = new Float32Array(totalLength);
+    let offset = 0;
+    for (const chunk of samplesRef.current) {
+      allSamples.set(chunk, offset);
+      offset += chunk.length;
+    }
+
+    return { samples: allSamples, sampleRate };
+  }, []);
+
   const stop = useCallback(async (): Promise<AudioData | null> => {
     if (!audioContextRef.current || !workletNodeRef.current) return null;
 
@@ -114,5 +135,5 @@ export function useAudioCapture() {
     return { samples: allSamples, sampleRate };
   }, []);
 
-  return { start, stop, analyserNode, isCapturing };
+  return { start, stop, getBuffer, analyserNode, isCapturing };
 }

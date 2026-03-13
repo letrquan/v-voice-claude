@@ -42,6 +42,16 @@ async fn transcribe(
 }
 
 #[tauri::command]
+async fn transcribe_streaming(
+    samples: Vec<f32>,
+    sample_rate: u32,
+    state: tauri::State<'_, SettingsState>,
+) -> Result<String, String> {
+    let settings = state.0.lock().unwrap().clone();
+    transcribe::transcribe_partial(samples, sample_rate, &settings.model, &settings.language).await
+}
+
+#[tauri::command]
 async fn type_text(text: String) -> Result<(), String> {
     tokio::task::spawn_blocking(move || keyboard::type_text(&text))
         .await
@@ -80,6 +90,7 @@ pub fn run() {
             download_model,
             download_specific_model,
             transcribe,
+            transcribe_streaming,
             type_text,
             settings::get_settings,
             settings::set_settings,

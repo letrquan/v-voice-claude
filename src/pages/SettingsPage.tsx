@@ -25,6 +25,7 @@ interface AppSettings {
 
 const LANGUAGES = [
   { code: "en", label: "English" },
+  { code: "vi", label: "Vietnamese (Tiếng Việt)" },
   { code: "auto", label: "Auto-detect" },
   { code: "zh", label: "Chinese" },
   { code: "de", label: "German" },
@@ -37,7 +38,6 @@ const LANGUAGES = [
   { code: "tr", label: "Turkish" },
   { code: "pl", label: "Polish" },
   { code: "it", label: "Italian" },
-  { code: "vi", label: "Vietnamese" },
   { code: "nl", label: "Dutch" },
   { code: "sv", label: "Swedish" },
   { code: "th", label: "Thai" },
@@ -164,11 +164,23 @@ export default function SettingsPage() {
   const update = useCallback(
     (patch: Partial<AppSettings>) => {
       if (!settings) return;
-      setSettings({ ...settings, ...patch });
+      const merged = { ...settings, ...patch };
+
+      // Auto-switch from English-only model to multilingual when selecting a non-English language
+      if (patch.language && patch.language !== "en" && merged.model.endsWith(".en")) {
+        const multilingualModel = merged.model.replace(".en", "");
+        // Check if the multilingual variant is available
+        const hasMultilingual = models.some((m) => m.id === multilingualModel);
+        if (hasMultilingual) {
+          merged.model = multilingualModel;
+        }
+      }
+
+      setSettings(merged);
       setDirty(true);
       setSaved(false);
     },
-    [settings]
+    [settings, models]
   );
 
   // ─── Save ───
@@ -291,18 +303,22 @@ export default function SettingsPage() {
         {/* ─── Language ─── */}
         <section className="settings-section">
           <h2>Language</h2>
-          {isEnModel && (
-            <p className="hint">English-only model selected. Language is fixed to English.</p>
+          {isEnModel && settings.language === "en" && (
+            <p className="hint">Selecting a non-English language will auto-switch to a multilingual model.</p>
           )}
           <select
-            value={isEnModel ? "en" : settings.language}
+            value={settings.language}
             onChange={(e) => update({ language: e.target.value })}
-            disabled={isEnModel}
           >
             {LANGUAGES.map((l) => (
               <option key={l.code} value={l.code}>{l.label}</option>
             ))}
           </select>
+          {settings.language === "vi" && (
+            <p className="hint" style={{ marginTop: 8 }}>
+              💡 For best Vietnamese accuracy, use the <strong>Small</strong> or <strong>Medium</strong> multilingual model.
+            </p>
+          )}
         </section>
 
         {/* ─── Microphone ─── */}
