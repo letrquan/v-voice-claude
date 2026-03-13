@@ -103,19 +103,19 @@ function App() {
   }, [settings]);
 
   // ─── VAD processing ───
-  const processVAD = useCallback(() => {
+  const processVAD = useCallback((rms: number) => {
     if (!analyserNode) return;
 
     const s = settingsRef.current;
-    const dataArr = new Uint8Array(analyserNode.fftSize);
-    analyserNode.getByteTimeDomainData(dataArr);
-
-    let sum = 0;
-    for (let i = 0; i < dataArr.length; i++) {
-      const v = (dataArr[i] - 128) / 128;
-      sum += v * v;
+    
+    // Dynamic sound-reactive glow
+    const pill = document.getElementById("pill");
+    if (pill) {
+      // Base glow 0.2, scales up to 0.9 based on volume (rms usually tiny, so multiply it)
+      const glowOpacity = Math.max(0.2, Math.min(0.9, 0.2 + rms * 10));
+      pill.style.setProperty("--glow-opacity", String(glowOpacity));
     }
-    const rms = Math.sqrt(sum / dataArr.length);
+
     const speech = rms > s.vad_silence_threshold;
 
     if (speech) {

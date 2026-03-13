@@ -224,133 +224,135 @@ export default function SettingsPage() {
 
   return (
     <div className="settings-page">
-      <h1>V Voice Settings</h1>
+      <div className="settings-container">
+        <h1>V Voice Settings</h1>
 
-      {/* ─── Model Selection ─── */}
-      <section className="settings-section">
-        <h2>Whisper Model</h2>
-        <div className="model-grid">
-          {models.map((m) => {
-            const downloaded = downloadedModels.includes(m.id);
-            const isActive = settings.model === m.id;
-            const isDownloading = downloadingModel === m.id;
+        {/* ─── Model Selection ─── */}
+        <section className="settings-section">
+          <h2>Whisper Model</h2>
+          <div className="model-grid">
+            {models.map((m) => {
+              const downloaded = downloadedModels.includes(m.id);
+              const isActive = settings.model === m.id;
+              const isDownloading = downloadingModel === m.id;
 
-            return (
-              <div
-                key={m.id}
-                className={`model-card ${isActive ? "active" : ""} ${downloaded ? "downloaded" : ""}`}
-              >
-                <div className="model-card-header">
-                  <span className="model-label">{m.label}</span>
-                  <span className="model-size">{m.size_mb < 1000 ? `${m.size_mb} MB` : `${(m.size_mb / 1000).toFixed(1)} GB`}</span>
-                </div>
-                <div className="model-card-actions">
-                  {downloaded ? (
-                    <>
-                      <button
-                        className={`btn btn-sm ${isActive ? "btn-active" : "btn-select"}`}
-                        onClick={() => update({ model: m.id })}
-                        disabled={isActive}
-                      >
-                        {isActive ? "Active" : "Select"}
-                      </button>
-                      {!isActive && (
+              return (
+                <div
+                  key={m.id}
+                  className={`model-card ${isActive ? "active" : ""} ${downloaded ? "downloaded" : ""}`}
+                >
+                  <div className="model-card-header">
+                    <span className="model-label">{m.label}</span>
+                    <span className="model-size">{m.size_mb < 1000 ? `${m.size_mb} MB` : `${(m.size_mb / 1000).toFixed(1)} GB`}</span>
+                  </div>
+                  <div className="model-card-actions">
+                    {downloaded ? (
+                      <>
                         <button
-                          className="btn btn-sm btn-danger"
-                          onClick={() => handleDeleteModel(m.id)}
+                          className={`btn btn-sm ${isActive ? "btn-active" : "btn-select"}`}
+                          onClick={() => update({ model: m.id })}
+                          disabled={isActive}
                         >
-                          Delete
+                          {isActive ? "Active" : "Select"}
                         </button>
-                      )}
-                    </>
-                  ) : isDownloading ? (
-                    <div className="download-bar-inline">
-                      <div
-                        className="download-bar-fill"
-                        style={{ width: `${downloadProgress}%` }}
-                      />
-                      <span>{Math.round(downloadProgress)}%</span>
-                    </div>
-                  ) : (
-                    <button
-                      className="btn btn-sm btn-download"
-                      onClick={() => handleDownloadModel(m.id)}
-                      disabled={downloadingModel !== null}
-                    >
-                      Download
-                    </button>
-                  )}
+                        {!isActive && (
+                          <button
+                            className="btn btn-sm btn-danger"
+                            onClick={() => handleDeleteModel(m.id)}
+                          >
+                            Delete
+                          </button>
+                        )}
+                      </>
+                    ) : isDownloading ? (
+                      <div className="download-bar-inline">
+                        <div
+                          className="download-bar-fill"
+                          style={{ width: `${downloadProgress}%` }}
+                        />
+                        <span>{Math.round(downloadProgress)}%</span>
+                      </div>
+                    ) : (
+                      <button
+                        className="btn btn-sm btn-download"
+                        onClick={() => handleDownloadModel(m.id)}
+                        disabled={downloadingModel !== null}
+                      >
+                        Download
+                      </button>
+                    )}
+                  </div>
                 </div>
-              </div>
-            );
-          })}
-        </div>
-      </section>
+              );
+            })}
+          </div>
+        </section>
 
-      {/* ─── Language ─── */}
-      <section className="settings-section">
-        <h2>Language</h2>
-        {isEnModel && (
-          <p className="hint">English-only model selected. Language is fixed to English.</p>
-        )}
-        <select
-          value={isEnModel ? "en" : settings.language}
-          onChange={(e) => update({ language: e.target.value })}
-          disabled={isEnModel}
-        >
-          {LANGUAGES.map((l) => (
-            <option key={l.code} value={l.code}>{l.label}</option>
-          ))}
-        </select>
-      </section>
-
-      {/* ─── Microphone ─── */}
-      <section className="settings-section">
-        <h2>Microphone</h2>
-        <select
-          value={settings.microphone_id}
-          onChange={(e) => update({ microphone_id: e.target.value })}
-        >
-          <option value="">System Default</option>
-          {microphones.map((mic) => (
-            <option key={mic.deviceId} value={mic.deviceId}>
-              {mic.label || `Microphone ${mic.deviceId.slice(0, 8)}`}
-            </option>
-          ))}
-        </select>
-      </section>
-
-      {/* ─── Hotkeys ─── */}
-      <section className="settings-section">
-        <h2>Hotkeys</h2>
-        <div className="hotkey-row">
-          <label>Hold-to-talk</label>
-          <button
-            className={`hotkey-btn ${capturingField === "hotkey" ? "capturing" : ""}`}
-            onClick={() => setCapturingField("hotkey")}
+        {/* ─── Language ─── */}
+        <section className="settings-section">
+          <h2>Language</h2>
+          {isEnModel && (
+            <p className="hint">English-only model selected. Language is fixed to English.</p>
+          )}
+          <select
+            value={isEnModel ? "en" : settings.language}
+            onChange={(e) => update({ language: e.target.value })}
+            disabled={isEnModel}
           >
-            {capturingField === "hotkey" ? "Press keys..." : formatHotkey(settings.hotkey)}
+            {LANGUAGES.map((l) => (
+              <option key={l.code} value={l.code}>{l.label}</option>
+            ))}
+          </select>
+        </section>
+
+        {/* ─── Microphone ─── */}
+        <section className="settings-section">
+          <h2>Microphone</h2>
+          <select
+            value={settings.microphone_id}
+            onChange={(e) => update({ microphone_id: e.target.value })}
+          >
+            <option value="">System Default</option>
+            {microphones.map((mic) => (
+              <option key={mic.deviceId} value={mic.deviceId}>
+                {mic.label || `Microphone ${mic.deviceId.slice(0, 8)}`}
+              </option>
+            ))}
+          </select>
+        </section>
+
+        {/* ─── Hotkeys ─── */}
+        <section className="settings-section">
+          <h2>Hotkeys</h2>
+          <div className="hotkey-row">
+            <label>Hold-to-talk</label>
+            <button
+              className={`hotkey-btn ${capturingField === "hotkey" ? "capturing" : ""}`}
+              onClick={() => setCapturingField("hotkey")}
+            >
+              {capturingField === "hotkey" ? "Press keys..." : formatHotkey(settings.hotkey)}
+            </button>
+          </div>
+          <div className="hotkey-row">
+            <label>Quit</label>
+            <button
+              className={`hotkey-btn ${capturingField === "quit_hotkey" ? "capturing" : ""}`}
+              onClick={() => setCapturingField("quit_hotkey")}
+            >
+              {capturingField === "quit_hotkey" ? "Press keys..." : formatHotkey(settings.quit_hotkey)}
+            </button>
+          </div>
+        </section>
+
+        {/* ─── Footer ─── */}
+        <div className="settings-footer">
+          <button className="btn btn-save" onClick={handleSave} disabled={!dirty}>
+            {saved ? "Saved!" : "Save"}
+          </button>
+          <button className="btn btn-cancel" onClick={() => getCurrentWindow().close()}>
+            Close
           </button>
         </div>
-        <div className="hotkey-row">
-          <label>Quit</label>
-          <button
-            className={`hotkey-btn ${capturingField === "quit_hotkey" ? "capturing" : ""}`}
-            onClick={() => setCapturingField("quit_hotkey")}
-          >
-            {capturingField === "quit_hotkey" ? "Press keys..." : formatHotkey(settings.quit_hotkey)}
-          </button>
-        </div>
-      </section>
-
-      {/* ─── Footer ─── */}
-      <div className="settings-footer">
-        <button className="btn btn-save" onClick={handleSave} disabled={!dirty}>
-          {saved ? "Saved!" : "Save"}
-        </button>
-        <button className="btn btn-cancel" onClick={() => getCurrentWindow().close()}>
-          Close
-        </button>
       </div>
     </div>
   );

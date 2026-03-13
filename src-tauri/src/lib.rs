@@ -56,8 +56,9 @@ fn open_settings_window(app: &tauri::AppHandle) {
     } else {
         let _win = WebviewWindowBuilder::new(app, "settings", WebviewUrl::App("index.html".into()))
             .title("V Voice Settings")
-            .inner_size(520.0, 560.0)
-            .resizable(false)
+            .inner_size(720.0, 640.0)
+            .min_inner_size(500.0, 400.0)
+            .resizable(true)
             .center()
             .decorations(true)
             .build();
