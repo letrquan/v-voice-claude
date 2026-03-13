@@ -1,0 +1,357 @@
+import { useState, useEffect, useCallback } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+
+/* ─── Types (mirror Rust structs) ─── */
+
+interface ModelInfo {
+  id: string;
+  filename: string;
+  label: string;
+  size_mb: number;
+  url: string;
+}
+
+interface AppSettings {
+  model: string;
+  language: string;
+  hotkey: string;
+  quit_hotkey: string;
+  microphone_id: string;
+  vad_silence_threshold: number;
+  vad_silence_frames: number;
+}
+
+const LANGUAGES = [
+  { code: "en", label: "English" },
+  { code: "auto", label: "Auto-detect" },
+  { code: "zh", label: "Chinese" },
+  { code: "de", label: "German" },
+  { code: "es", label: "Spanish" },
+  { code: "ru", label: "Russian" },
+  { code: "ko", label: "Korean" },
+  { code: "fr", label: "French" },
+  { code: "ja", label: "Japanese" },
+  { code: "pt", label: "Portuguese" },
+  { code: "tr", label: "Turkish" },
+  { code: "pl", label: "Polish" },
+  { code: "it", label: "Italian" },
+  { code: "vi", label: "Vietnamese" },
+  { code: "nl", label: "Dutch" },
+  { code: "sv", label: "Swedish" },
+  { code: "th", label: "Thai" },
+  { code: "id", label: "Indonesian" },
+  { code: "hi", label: "Hindi" },
+  { code: "ar", label: "Arabic" },
+];
+
+/* ─── Hotkey capture helpers ─── */
+
+const MODIFIER_KEYS = new Set([
+  "Control",
+  "Shift",
+  "Alt",
+  "Meta",
+]);
+
+const KEY_MAP: Record<string, string> = {
+  Control: "CommandOrControl",
+  Meta: "CommandOrControl",
+  " ": "Space",
+  ArrowUp: "Up",
+  ArrowDown: "Down",
+  ArrowLeft: "Left",
+  ArrowRight: "Right",
+};
+
+function keyboardEventToAccelerator(e: KeyboardEvent): string | null {
+  const parts: string[] = [];
+  if (e.ctrlKey || e.metaKey) parts.push("CommandOrControl");
+  if (e.shiftKey) parts.push("Shift");
+  if (e.altKey) parts.push("Alt");
+
+  // Need at least one modifier
+  if (parts.length === 0) return null;
+
+  const key = e.key;
+  if (MODIFIER_KEYS.has(key)) return null; // only modifiers pressed so far
+
+  const mapped = KEY_MAP[key] || key.toUpperCase();
+  parts.push(mapped);
+  return parts.join("+");
+}
+
+function formatHotkey(accel: string): string {
+  return accel
+    .replace("CommandOrControl", "Ctrl")
+    .replace(/\+/g, " + ");
+}
+
+/* ─── Component ─── */
+
+export default function SettingsPage() {
+  const [settings, setSettings] = useState<AppSettings | null>(null);
+  const [models, setModels] = useState<ModelInfo[]>([]);
+  const [downloadedModels, setDownloadedModels] = useState<string[]>([]);
+  const [microphones, setMicrophones] = useState<MediaDeviceInfo[]>([]);
+  const [downloadingModel, setDownloadingModel] = useState<string | null>(null);
+  const [downloadProgress, setDownloadProgress] = useState(0);
+  const [capturingField, setCapturingField] = useState<"hotkey" | "quit_hotkey" | null>(null);
+  const [saved, setSaved] = useState(false);
+  const [dirty, setDirty] = useState(false);
+
+  // ─── Load initial data ───
+  useEffect(() => {
+    Promise.all([
+      invoke<AppSettings>("get_settings"),
+      invoke<ModelInfo[]>("get_available_models"),
+      invoke<string[]>("get_downloaded_models"),
+    ]).then(([s, m, d]) => {
+      setSettings(s);
+      setModels(m);
+      setDownloadedModels(d);
+    });
+
+    // Enumerate microphones
+    navigator.mediaDevices
+      .getUserMedia({ audio: true })
+      .then((stream) => {
+        stream.getTracks().forEach((t) => t.stop());
+        return navigator.mediaDevices.enumerateDevices();
+      })
+      .then((devices) => {
+        setMicrophones(devices.filter((d) => d.kind === "audioinput"));
+      })
+      .catch(() => {});
+
+    // Listen for download progress
+    const unlisten = listen<number>("download-progress", (e) => {
+      setDownloadProgress(e.payload);
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+
+  // ─── Hotkey capture ───
+  useEffect(() => {
+    if (!capturingField || !settings) return;
+
+    const handler = (e: KeyboardEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+
+      // Escape cancels
+      if (e.key === "Escape") {
+        setCapturingField(null);
+        return;
+      }
+
+      const accel = keyboardEventToAccelerator(e);
+      if (accel) {
+        setSettings({ ...settings, [capturingField]: accel });
+        setCapturingField(null);
+        setDirty(true);
+      }
+    };
+
+    window.addEventListener("keydown", handler, true);
+    return () => window.removeEventListener("keydown", handler, true);
+  }, [capturingField, settings]);
+
+  // ─── Updater helper ───
+  const update = useCallback(
+    (patch: Partial<AppSettings>) => {
+      if (!settings) return;
+      setSettings({ ...settings, ...patch });
+      setDirty(true);
+      setSaved(false);
+    },
+    [settings]
+  );
+
+  // ─── Save ───
+  const handleSave = useCallback(async () => {
+    if (!settings) return;
+    try {
+      await invoke("set_settings", { settings });
+      setDirty(false);
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+    } catch (e) {
+      console.error("Failed to save settings:", e);
+    }
+  }, [settings]);
+
+  // ─── Download a model ───
+  const handleDownloadModel = useCallback(
+    async (modelId: string) => {
+      setDownloadingModel(modelId);
+      setDownloadProgress(0);
+      try {
+        await invoke("download_specific_model", { modelId });
+        const updated = await invoke<string[]>("get_downloaded_models");
+        setDownloadedModels(updated);
+      } catch (e) {
+        console.error("Model download failed:", e);
+      } finally {
+        setDownloadingModel(null);
+      }
+    },
+    []
+  );
+
+  // ─── Delete a model ───
+  const handleDeleteModel = useCallback(
+    async (modelId: string) => {
+      try {
+        await invoke("delete_model", { modelId });
+        const updated = await invoke<string[]>("get_downloaded_models");
+        setDownloadedModels(updated);
+      } catch (e) {
+        console.error("Model delete failed:", e);
+      }
+    },
+    []
+  );
+
+  if (!settings) {
+    return <div className="settings-page"><p>Loading...</p></div>;
+  }
+
+  const isEnModel = settings.model.endsWith(".en");
+
+  return (
+    <div className="settings-page">
+      <h1>V Voice Settings</h1>
+
+      {/* ─── Model Selection ─── */}
+      <section className="settings-section">
+        <h2>Whisper Model</h2>
+        <div className="model-grid">
+          {models.map((m) => {
+            const downloaded = downloadedModels.includes(m.id);
+            const isActive = settings.model === m.id;
+            const isDownloading = downloadingModel === m.id;
+
+            return (
+              <div
+                key={m.id}
+                className={`model-card ${isActive ? "active" : ""} ${downloaded ? "downloaded" : ""}`}
+              >
+                <div className="model-card-header">
+                  <span className="model-label">{m.label}</span>
+                  <span className="model-size">{m.size_mb < 1000 ? `${m.size_mb} MB` : `${(m.size_mb / 1000).toFixed(1)} GB`}</span>
+                </div>
+                <div className="model-card-actions">
+                  {downloaded ? (
+                    <>
+                      <button
+                        className={`btn btn-sm ${isActive ? "btn-active" : "btn-select"}`}
+                        onClick={() => update({ model: m.id })}
+                        disabled={isActive}
+                      >
+                        {isActive ? "Active" : "Select"}
+                      </button>
+                      {!isActive && (
+                        <button
+                          className="btn btn-sm btn-danger"
+                          onClick={() => handleDeleteModel(m.id)}
+                        >
+                          Delete
+                        </button>
+                      )}
+                    </>
+                  ) : isDownloading ? (
+                    <div className="download-bar-inline">
+                      <div
+                        className="download-bar-fill"
+                        style={{ width: `${downloadProgress}%` }}
+                      />
+                      <span>{Math.round(downloadProgress)}%</span>
+                    </div>
+                  ) : (
+                    <button
+                      className="btn btn-sm btn-download"
+                      onClick={() => handleDownloadModel(m.id)}
+                      disabled={downloadingModel !== null}
+                    >
+                      Download
+                    </button>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </section>
+
+      {/* ─── Language ─── */}
+      <section className="settings-section">
+        <h2>Language</h2>
+        {isEnModel && (
+          <p className="hint">English-only model selected. Language is fixed to English.</p>
+        )}
+        <select
+          value={isEnModel ? "en" : settings.language}
+          onChange={(e) => update({ language: e.target.value })}
+          disabled={isEnModel}
+        >
+          {LANGUAGES.map((l) => (
+            <option key={l.code} value={l.code}>{l.label}</option>
+          ))}
+        </select>
+      </section>
+
+      {/* ─── Microphone ─── */}
+      <section className="settings-section">
+        <h2>Microphone</h2>
+        <select
+          value={settings.microphone_id}
+          onChange={(e) => update({ microphone_id: e.target.value })}
+        >
+          <option value="">System Default</option>
+          {microphones.map((mic) => (
+            <option key={mic.deviceId} value={mic.deviceId}>
+              {mic.label || `Microphone ${mic.deviceId.slice(0, 8)}`}
+            </option>
+          ))}
+        </select>
+      </section>
+
+      {/* ─── Hotkeys ─── */}
+      <section className="settings-section">
+        <h2>Hotkeys</h2>
+        <div className="hotkey-row">
+          <label>Hold-to-talk</label>
+          <button
+            className={`hotkey-btn ${capturingField === "hotkey" ? "capturing" : ""}`}
+            onClick={() => setCapturingField("hotkey")}
+          >
+            {capturingField === "hotkey" ? "Press keys..." : formatHotkey(settings.hotkey)}
+          </button>
+        </div>
+        <div className="hotkey-row">
+          <label>Quit</label>
+          <button
+            className={`hotkey-btn ${capturingField === "quit_hotkey" ? "capturing" : ""}`}
+            onClick={() => setCapturingField("quit_hotkey")}
+          >
+            {capturingField === "quit_hotkey" ? "Press keys..." : formatHotkey(settings.quit_hotkey)}
+          </button>
+        </div>
+      </section>
+
+      {/* ─── Footer ─── */}
+      <div className="settings-footer">
+        <button className="btn btn-save" onClick={handleSave} disabled={!dirty}>
+          {saved ? "Saved!" : "Save"}
+        </button>
+        <button className="btn btn-cancel" onClick={() => getCurrentWindow().close()}>
+          Close
+        </button>
+      </div>
+    </div>
+  );
+}

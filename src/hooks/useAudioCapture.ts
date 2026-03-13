@@ -15,14 +15,20 @@ export function useAudioCapture() {
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const samplesRef = useRef<Float32Array[]>([]);
 
-  const start = useCallback(async () => {
+  /** Start capture. Pass a deviceId to use a specific microphone, or "" for default. */
+  const start = useCallback(async (deviceId?: string) => {
     try {
+      const audioConstraints: MediaTrackConstraints = {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      };
+      if (deviceId) {
+        audioConstraints.deviceId = { exact: deviceId };
+      }
+
       const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
+        audio: audioConstraints,
       });
       streamRef.current = stream;
 

@@ -10,8 +10,10 @@
     "tauri": "tauri"
   },
   "dependencies": {
+    "@fontsource/jetbrains-mono": "^5.2.8",
     "@tauri-apps/api": "^2.0.0",
     "@tauri-apps/plugin-global-shortcut": "^2.0.0",
+    "@tauri-apps/plugin-store": "^2.4.2",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },

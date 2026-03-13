@@ -9,9 +9,27 @@ import { useAudioCapture } from "./hooks/useAudioCapture";
 
 type AppState = "idle" | "listening" | "processing";
 
-const VAD = {
-  SILENCE_THRESHOLD: 0.015,
-  SILENCE_FRAMES: 45,
+interface AppSettings {
+  model: string;
+  language: string;
+  hotkey: string;
+  quit_hotkey: string;
+  microphone_id: string;
+  vad_silence_threshold: number;
+  vad_silence_frames: number;
+}
+
+const DEFAULT_SETTINGS: AppSettings = {
+  model: "tiny.en",
+  language: "en",
+  hotkey: "CommandOrControl+Shift+Space",
+  quit_hotkey: "CommandOrControl+Shift+Q",
+  microphone_id: "",
+  vad_silence_threshold: 0.015,
+  vad_silence_frames: 45,
+};
+
+const VAD_DEFAULTS = {
   MIN_SPEECH_FRAMES: 8,
   RING_CIRC: 38,
 };
@@ -22,13 +40,11 @@ const SIZE_PILL = { w: 260, h: 48 };
 const SIZE_TALL = { w: 260, h: 100 };
 
 /* ─── Timing ─── */
-const TRANSITION_MS = 420; // CSS pill spring transition duration + margin
+const TRANSITION_MS = 420;
 const SHOW_TRANSCRIPT_DELAY = 300;
 
 /**
  * Resize the window while keeping its visual center-x and bottom-y anchored.
- * This way, if the user drags the pill somewhere, expand/collapse happens
- * in-place instead of snapping back to screen center.
  */
 async function resizeInPlace(width: number, height: number) {
   const win = getCurrentWindow();
@@ -59,12 +75,15 @@ function App() {
   const [downloadProgress, setDownloadProgress] = useState(0);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [showTranscript, setShowTranscript] = useState(false);
+  const [errorMsg, setErrorMsg] = useState("");
+  const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
 
   const stateRef = useRef<AppState>("idle");
   const modelReadyRef = useRef(false);
+  const settingsRef = useRef<AppSettings>(DEFAULT_SETTINGS);
   const vadArcRef = useRef<SVGCircleElement>(null);
 
-  // VAD state refs (updated every frame, not React state)
+  // VAD state refs
   const silentFramesRef = useRef(0);
   const speechFramesRef = useRef(0);
   const isSpeakingRef = useRef(false);
@@ -79,25 +98,30 @@ function App() {
     modelReadyRef.current = modelReady;
   }, [modelReady]);
 
-  // ─── VAD processing (runs each animation frame via Waveform onFrame) ───
+  useEffect(() => {
+    settingsRef.current = settings;
+  }, [settings]);
+
+  // ─── VAD processing ───
   const processVAD = useCallback(() => {
     if (!analyserNode) return;
 
+    const s = settingsRef.current;
     const dataArr = new Uint8Array(analyserNode.fftSize);
     analyserNode.getByteTimeDomainData(dataArr);
 
     let sum = 0;
     for (let i = 0; i < dataArr.length; i++) {
-      const s = (dataArr[i] - 128) / 128;
-      sum += s * s;
+      const v = (dataArr[i] - 128) / 128;
+      sum += v * v;
     }
     const rms = Math.sqrt(sum / dataArr.length);
-    const speech = rms > VAD.SILENCE_THRESHOLD;
+    const speech = rms > s.vad_silence_threshold;
 
     if (speech) {
       speechFramesRef.current++;
       silentFramesRef.current = 0;
-      if (!isSpeakingRef.current && speechFramesRef.current >= VAD.MIN_SPEECH_FRAMES) {
+      if (!isSpeakingRef.current && speechFramesRef.current >= VAD_DEFAULTS.MIN_SPEECH_FRAMES) {
         isSpeakingRef.current = true;
         setIsSpeaking(true);
       }
@@ -105,50 +129,71 @@ function App() {
       silentFramesRef.current++;
       if (isSpeakingRef.current) speechFramesRef.current = 0;
 
-      // Update VAD arc
-      const prog = Math.min(silentFramesRef.current / VAD.SILENCE_FRAMES, 1);
+      const prog = Math.min(silentFramesRef.current / s.vad_silence_frames, 1);
       if (vadArcRef.current) {
-        vadArcRef.current.style.strokeDashoffset = (VAD.RING_CIRC * (1 - prog)).toFixed(2);
+        vadArcRef.current.style.strokeDashoffset = (VAD_DEFAULTS.RING_CIRC * (1 - prog)).toFixed(2);
       }
 
-      if (isSpeakingRef.current && silentFramesRef.current >= VAD.SILENCE_FRAMES) {
+      if (isSpeakingRef.current && silentFramesRef.current >= s.vad_silence_frames) {
         isSpeakingRef.current = false;
         silentFramesRef.current = 0;
         setIsSpeaking(false);
         if (vadArcRef.current) {
-          vadArcRef.current.style.strokeDashoffset = String(VAD.RING_CIRC);
+          vadArcRef.current.style.strokeDashoffset = String(VAD_DEFAULTS.RING_CIRC);
+        }
+        if (stateRef.current === "listening") {
+          toggleRef.current();
         }
       }
     }
   }, [analyserNode]);
 
-  // ─── Toggle: idle → listening → processing → idle ───
+  // ─── Close button (cancel listening) ───
+  const handleClose = useCallback(async () => {
+    if (stateRef.current === "listening") {
+      await stop();
+      setState("idle");
+      stateRef.current = "idle";
+      setShowTranscript(false);
+      setIsSpeaking(false);
+      silentFramesRef.current = 0;
+      speechFramesRef.current = 0;
+      isSpeakingRef.current = false;
+      await new Promise((r) => setTimeout(r, TRANSITION_MS));
+      await resizeInPlace(SIZE_IDLE.w, SIZE_IDLE.h);
+      setTranscript("");
+    }
+  }, [stop]);
+
+  // ─── Quit app ───
+  const handleQuit = useCallback(async () => {
+    if (stateRef.current === "listening") {
+      await stop();
+    }
+    await getCurrentWindow().close();
+  }, [stop]);
+
+  // ─── Toggle: idle -> listening -> processing -> idle ───
   const handleToggle = useCallback(async () => {
     const currentState = stateRef.current;
 
     if (currentState === "idle" && modelReadyRef.current) {
-      // ── EXPAND: idle → listening ──
-      // Reset VAD
       silentFramesRef.current = 0;
       speechFramesRef.current = 0;
       isSpeakingRef.current = false;
       setIsSpeaking(false);
       setTranscript("");
       setShowTranscript(false);
+      setErrorMsg("");
 
-      // 1. Resize window FIRST (so pill has room)
       await resizeInPlace(SIZE_PILL.w, SIZE_PILL.h);
-
-      // 2. Apply CSS classes (pill animates to fill the space)
       setState("listening");
       stateRef.current = "listening";
 
-      // 3. Start audio capture
-      await start();
+      // Pass microphone deviceId from settings
+      await start(settingsRef.current.microphone_id || undefined);
 
-      // 4. After a beat, grow window to tall size and show transcript row
       setTimeout(async () => {
-        // Only if still listening
         if (stateRef.current === "listening") {
           await resizeInPlace(SIZE_TALL.w, SIZE_TALL.h);
           setShowTranscript(true);
@@ -156,8 +201,6 @@ function App() {
       }, SHOW_TRANSCRIPT_DELAY);
 
     } else if (currentState === "listening") {
-      // ── COLLAPSE: listening → processing → idle ──
-      // Switch to processing (pill stays expanded, inner content swaps via CSS)
       setState("processing");
       stateRef.current = "processing";
 
@@ -171,100 +214,167 @@ function App() {
           });
           if (result.trim()) {
             setTranscript(result.trim());
-            // Brief pause so user sees the result before typing
             await new Promise((r) => setTimeout(r, 400));
             await invoke("type_text", { text: result.trim() });
           }
         } catch (e) {
           console.error("Transcription error:", e);
-          setTranscript("Error: " + String(e));
+          setTranscript("");
+          setErrorMsg(String(e));
         }
       }
 
-      // ── Now collapse back to idle ──
-      // 1. Remove CSS classes first (pill animates to circle)
       setState("idle");
       stateRef.current = "idle";
       setShowTranscript(false);
       setIsSpeaking(false);
-
-      // 2. Wait for CSS transition to finish, THEN resize window
       await new Promise((r) => setTimeout(r, TRANSITION_MS));
       await resizeInPlace(SIZE_IDLE.w, SIZE_IDLE.h);
-
-      // Clear old transcript after a moment
       setTimeout(() => setTranscript(""), 2000);
     }
   }, [start, stop]);
 
-  // ─── Close button (cancel listening) ───
-  const handleClose = useCallback(async () => {
-    if (stateRef.current === "listening") {
-      await stop();
-
-      // 1. Remove CSS classes first
-      setState("idle");
-      stateRef.current = "idle";
-      setShowTranscript(false);
-      setIsSpeaking(false);
-      silentFramesRef.current = 0;
-      speechFramesRef.current = 0;
-      isSpeakingRef.current = false;
-
-      // 2. Wait for CSS transition, then resize
-      await new Promise((r) => setTimeout(r, TRANSITION_MS));
-      await resizeInPlace(SIZE_IDLE.w, SIZE_IDLE.h);
-      setTranscript("");
-    }
-  }, [stop]);
-
-  // Keep toggle ref up to date for hotkey callback
   const toggleRef = useRef(handleToggle);
   useEffect(() => {
     toggleRef.current = handleToggle;
   }, [handleToggle]);
 
-  // ─── Download model on mount ───
+  const quitRef = useRef(handleQuit);
   useEffect(() => {
-    invoke<boolean>("is_model_ready")
+    quitRef.current = handleQuit;
+  }, [handleQuit]);
+
+  // ─── Retry download ───
+  const handleRetry = useCallback(() => {
+    setErrorMsg("");
+    setDownloadProgress(0);
+    invoke("download_model")
+      .then(() => setModelReady(true))
+      .catch((e) => {
+        console.error("Retry download error:", e);
+        setErrorMsg("Download failed. Click to retry.");
+      });
+  }, []);
+
+  // ─── Register / re-register hotkeys ───
+  const registerHotkeys = useCallback(async (s: AppSettings) => {
+    // Unregister old ones first (best effort)
+    try { await unregister("CommandOrControl+Shift+Space"); } catch {}
+    try { await unregister("CommandOrControl+Shift+Q"); } catch {}
+    // Also try to unregister the actual configured keys in case they differ
+    try { await unregister(s.hotkey); } catch {}
+    try { await unregister(s.quit_hotkey); } catch {}
+
+    // Register hold-to-talk
+    await register(s.hotkey, (event: any) => {
+      if (event.state === "Pressed") {
+        if (stateRef.current === "idle") {
+          toggleRef.current();
+        }
+      } else if (event.state === "Released") {
+        if (stateRef.current === "listening") {
+          toggleRef.current();
+        }
+      }
+    });
+
+    // Register quit
+    await register(s.quit_hotkey, (event: any) => {
+      if (!event.state || event.state === "Pressed") {
+        quitRef.current();
+      }
+    });
+  }, []);
+
+  // ─── Load settings + model on mount ───
+  useEffect(() => {
+    // Load settings first, then check model
+    invoke<AppSettings>("get_settings")
+      .then((s) => {
+        setSettings(s);
+        settingsRef.current = s;
+
+        // Register hotkeys with loaded settings
+        registerHotkeys(s).catch(console.error);
+
+        // Check model readiness
+        return invoke<boolean>("is_model_ready");
+      })
       .then((ready) => {
         setModelReady(ready);
         if (!ready) {
           invoke("download_model")
             .then(() => setModelReady(true))
-            .catch(console.error);
+            .catch((e) => {
+              console.error("Download error:", e);
+              setErrorMsg("Download failed. Click to retry.");
+            });
         }
       })
-      .catch(console.error);
+      .catch((e) => {
+        console.error("Init error:", e);
+        setErrorMsg("Failed to initialize. Click to retry.");
+        // Still register default hotkeys
+        registerHotkeys(DEFAULT_SETTINGS).catch(console.error);
+      });
 
-    const unlisten = listen<number>("download-progress", (event) => {
+    // Download progress listener
+    const unlistenProgress = listen<number>("download-progress", (event) => {
       setDownloadProgress(event.payload);
     });
 
-    return () => {
-      unlisten.then((fn) => fn());
-    };
-  }, []);
+    // Settings changed listener (from settings window)
+    const unlistenSettings = listen("settings-changed", async () => {
+      try {
+        const s = await invoke<AppSettings>("get_settings");
+        const oldSettings = settingsRef.current;
+        setSettings(s);
+        settingsRef.current = s;
 
-  // ─── Register global shortcut ───
-  useEffect(() => {
-    register("CommandOrControl+Shift+Space", (event: any) => {
-      if (!event.state || event.state === "Pressed") {
-        toggleRef.current();
+        // Re-register hotkeys if they changed
+        if (s.hotkey !== oldSettings.hotkey || s.quit_hotkey !== oldSettings.quit_hotkey) {
+          // Unregister old hotkeys
+          try { await unregister(oldSettings.hotkey); } catch {}
+          try { await unregister(oldSettings.quit_hotkey); } catch {}
+          await registerHotkeys(s);
+        }
+
+        // Re-check model if model changed
+        if (s.model !== oldSettings.model) {
+          const ready = await invoke<boolean>("is_model_ready");
+          setModelReady(ready);
+          if (!ready) {
+            invoke("download_model")
+              .then(() => setModelReady(true))
+              .catch((e) => {
+                console.error("Download error:", e);
+                setErrorMsg("Download failed. Click to retry.");
+              });
+          }
+        }
+      } catch (e) {
+        console.error("Failed to reload settings:", e);
       }
-    }).catch(console.error);
+    });
 
     return () => {
-      unregister("CommandOrControl+Shift+Space").catch(console.error);
+      unlistenProgress.then((fn) => fn());
+      unlistenSettings.then((fn) => fn());
+      // Cleanup hotkeys
+      const s = settingsRef.current;
+      unregister(s.hotkey).catch(() => {});
+      unregister(s.quit_hotkey).catch(() => {});
     };
-  }, []);
+  }, [registerHotkeys]);
 
   // ─── Build CSS classes for #pill ───
-  // All state-driven, no conditional rendering needed.
   const pillClasses: string[] = [];
 
-  if (!modelReady) {
+  if (!modelReady && !errorMsg) {
     pillClasses.push("downloading");
+  }
+  if (errorMsg && state === "idle") {
+    pillClasses.push("has-error");
   }
   if (state === "listening") {
     pillClasses.push("expanded", "listening");
@@ -279,13 +389,22 @@ function App() {
     pillClasses.push("vad-active");
   }
 
-  // Download progress ring (circumference of r=11 circle ≈ 69.115)
   const downloadCircumference = 69.115;
   const downloadOffset = downloadCircumference * (1 - downloadProgress / 100);
 
   return (
-    <div id="pill" className={pillClasses.join(" ")} data-tauri-drag-region>
-      {/* ─── Mic icon — ALWAYS in DOM, CSS hides when downloading/expanded ─── */}
+    <div
+      id="pill"
+      className={pillClasses.join(" ")}
+      data-tauri-drag-region
+      onClick={errorMsg && state === "idle" ? handleRetry : undefined}
+    >
+      {/* ─── Quit button ─── */}
+      <button className="quit-btn" onClick={handleQuit} title={`Quit (${settings.quit_hotkey.replace("CommandOrControl", "Ctrl").replace(/\+/g, "+")})`}>
+        &#x2715;
+      </button>
+
+      {/* ─── Mic icon ─── */}
       <div className="mic-icon" data-tauri-drag-region>
         <svg viewBox="0 0 18 18" fill="none" data-tauri-drag-region>
           <rect x="6" y="1" width="6" height="10" rx="3" fill="var(--muted)" stroke="none" />
@@ -305,7 +424,7 @@ function App() {
         </svg>
       </div>
 
-      {/* ─── Download ring — ALWAYS in DOM, CSS shows only when .downloading ─── */}
+      {/* ─── Download ring ─── */}
       <div className="download-bar" data-tauri-drag-region>
         <svg viewBox="0 0 28 28" data-tauri-drag-region>
           <circle className="download-ring-bg" cx="14" cy="14" r="11" />
@@ -322,7 +441,16 @@ function App() {
         </svg>
       </div>
 
-      {/* ─── Inner row — ALWAYS in DOM, CSS shows when .expanded ─── */}
+      {/* ─── Error indicator ─── */}
+      <div className="error-icon" data-tauri-drag-region>
+        <svg viewBox="0 0 18 18" fill="none" data-tauri-drag-region>
+          <circle cx="9" cy="9" r="8" fill="none" stroke="var(--danger)" strokeWidth="1.5" />
+          <line x1="9" y1="5" x2="9" y2="10" stroke="var(--danger)" strokeWidth="1.5" strokeLinecap="round" />
+          <circle cx="9" cy="13" r="1" fill="var(--danger)" />
+        </svg>
+      </div>
+
+      {/* ─── Inner row ─── */}
       <div className="inner-row" data-tauri-drag-region>
         <div className="canvas-wrap" data-tauri-drag-region>
           <Waveform analyserNode={analyserNode} onFrame={processVAD} />
@@ -345,16 +473,18 @@ function App() {
         </button>
       </div>
 
-      {/* ─── Processing overlay — ALWAYS in DOM, CSS fades in when .processing ─── */}
+      {/* ─── Processing overlay ─── */}
       <div className="processing-overlay" data-tauri-drag-region>
         <div className="spinner" data-tauri-drag-region />
         <span className="processing-text" data-tauri-drag-region>...</span>
       </div>
 
-      {/* ─── Transcript row — ALWAYS in DOM, CSS shows when .show-transcript ─── */}
+      {/* ─── Transcript row ─── */}
       <div className="transcript-row" data-tauri-drag-region>
         <div className="tx" data-tauri-drag-region>
-          {state === "processing" ? (
+          {errorMsg && state !== "idle" ? (
+            <span className="tx-error">{errorMsg}</span>
+          ) : state === "processing" ? (
             <span className="tx-pending">processing...</span>
           ) : transcript ? (
             transcript.slice(-80)

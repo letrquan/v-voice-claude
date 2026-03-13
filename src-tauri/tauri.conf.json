@@ -29,5 +29,30 @@
       "csp": null
     }
   },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/256x256.png",
+      "icons/icon.ico",
+      "icons/icon.png"
+    ],
+    "resources": [],
+    "copyright": "",
+    "shortDescription": "Voice-to-text floating widget powered by Whisper",
+    "longDescription": "V Voice is a floating always-on-top voice-to-text desktop widget. Press Ctrl+Shift+Space to activate, speak, and your words are automatically typed into the focused application.",
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "displayLanguageSelector": false,
+        "languages": ["English"]
+      },
+      "webviewInstallMode": {
+        "type": "embedBootstrapper"
+      }
+    }
+  },
   "plugins": {}
 }

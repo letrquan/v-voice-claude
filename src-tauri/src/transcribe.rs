@@ -4,8 +4,7 @@ use std::path::PathBuf;
 use futures_util::StreamExt;
 use tauri::Emitter;
 
-const MODEL_URL: &str =
-    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin";
+use crate::settings;
 
 const WHISPER_CLI_ZIP_URL: &str =
     "https://github.com/ggml-org/whisper.cpp/releases/download/v1.8.3/whisper-bin-x64.zip";
@@ -18,9 +17,10 @@ fn data_dir() -> PathBuf {
     base.join("v-voice-claude")
 }
 
-/// Path to the GGML model file
-pub fn model_path() -> PathBuf {
-    data_dir().join("models").join("ggml-tiny.en.bin")
+/// Path to a model file by model id (e.g. "tiny.en" -> "ggml-tiny.en.bin")
+pub fn model_path(model_id: &str) -> PathBuf {
+    let filename = format!("ggml-{}.bin", model_id);
+    data_dir().join("models").join(filename)
 }
 
 /// Path to the whisper-cli.exe binary
@@ -28,9 +28,9 @@ fn cli_path() -> PathBuf {
     data_dir().join("bin").join("whisper-cli.exe")
 }
 
-/// Check if both the model and CLI binary are available
-pub fn is_ready() -> bool {
-    model_path().exists() && cli_path().exists()
+/// Check if both the given model and CLI binary are available
+pub fn is_ready(model_id: &str) -> bool {
+    model_path(model_id).exists() && cli_path().exists()
 }
 
 /// Download a URL into memory, emitting progress events.
@@ -62,11 +62,17 @@ async fn download_bytes(
     Ok(bytes)
 }
 
-/// Download the GGML model and whisper-cli.exe binary (if not already present).
+/// Download the specified GGML model and whisper-cli.exe binary (if not already present).
 /// Emits "download-progress" events to the frontend.
-pub async fn download_model(app: tauri::AppHandle) -> Result<(), String> {
-    let model = model_path();
+pub async fn download_model(app: tauri::AppHandle, model_id: &str) -> Result<(), String> {
+    let model = model_path(model_id);
     let cli = cli_path();
+
+    // Look up model URL from the available models list
+    let model_info = settings::available_models()
+        .into_iter()
+        .find(|m| m.id == model_id)
+        .ok_or_else(|| format!("Unknown model: {}", model_id))?;
 
     // If both exist, nothing to do
     if model.exists() && cli.exists() {
@@ -74,7 +80,7 @@ pub async fn download_model(app: tauri::AppHandle) -> Result<(), String> {
         return Ok(());
     }
 
-    // --- Download model (ggml-tiny.en.bin ~75MB) ---
+    // --- Download model ---
     if !model.exists() {
         let _ = app.emit("download-progress", 0.0_f64);
 
@@ -84,7 +90,7 @@ pub async fn download_model(app: tauri::AppHandle) -> Result<(), String> {
                 .map_err(|e| format!("Failed to create models dir: {}", e))?;
         }
 
-        let bytes = download_bytes(&app, MODEL_URL, "model").await?;
+        let bytes = download_bytes(&app, &model_info.url, "model").await?;
         tokio::fs::write(&model, &bytes)
             .await
             .map_err(|e| format!("Failed to save model: {}", e))?;
@@ -113,11 +119,8 @@ pub async fn download_model(app: tauri::AppHandle) -> Result<(), String> {
                 .map_err(|e| format!("Zip entry error: {}", e))?;
 
             let name = file.name().to_string();
-
-            // Extract the filename from the path inside the zip
             let file_name = name.rsplit('/').next().unwrap_or(&name);
 
-            // We want whisper-cli.exe and any .dll files it might need
             let should_extract =
                 file_name == "whisper-cli.exe" || file_name.ends_with(".dll");
 
@@ -126,7 +129,6 @@ pub async fn download_model(app: tauri::AppHandle) -> Result<(), String> {
                 let mut buf = Vec::new();
                 file.read_to_end(&mut buf)
                     .map_err(|e| format!("Failed to read {} from zip: {}", file_name, e))?;
-                // Use std::fs since we're not in an async block for the zip reader
                 std::fs::write(&dest, &buf)
                     .map_err(|e| format!("Failed to write {}: {}", file_name, e))?;
 
@@ -169,9 +171,14 @@ fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
     resampled
 }
 
-/// Transcribe audio by writing a temporary WAV file and calling whisper-cli.exe
-pub async fn transcribe_audio(samples: Vec<f32>, sample_rate: u32) -> Result<String, String> {
-    let model = model_path();
+/// Transcribe audio using the specified model and language
+pub async fn transcribe_audio(
+    samples: Vec<f32>,
+    sample_rate: u32,
+    model_id: &str,
+    language: &str,
+) -> Result<String, String> {
+    let model = model_path(model_id);
     let cli = cli_path();
 
     if !model.exists() {
@@ -204,7 +211,6 @@ pub async fn transcribe_audio(samples: Vec<f32>, sample_rate: u32) -> Result<Str
             .map_err(|e| format!("Failed to create WAV file: {}", e))?;
 
         for &sample in &audio_data {
-            // Convert f32 [-1.0, 1.0] to i16
             let s = (sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
             writer
                 .write_sample(s)
@@ -219,16 +225,24 @@ pub async fn transcribe_audio(samples: Vec<f32>, sample_rate: u32) -> Result<Str
     .await
     .map_err(|e| format!("WAV write task error: {}", e))??;
 
-    // Call whisper-cli.exe as a subprocess
-    let output = tokio::process::Command::new(cli.to_str().unwrap())
-        .arg("-m")
-        .arg(model.to_str().unwrap())
-        .arg("-f")
-        .arg(wav_path.to_str().unwrap())
-        .arg("--no-timestamps")
-        .arg("-l")
-        .arg("en")
-        .arg("--no-prints")
+    // Build whisper-cli command
+    let cli_str = cli.to_str().unwrap();
+    let model_str = model.to_str().unwrap();
+    let wav_str = wav_path.to_str().unwrap();
+
+    let mut cmd = tokio::process::Command::new(cli_str);
+    cmd.arg("-m").arg(model_str);
+    cmd.arg("-f").arg(wav_str);
+    cmd.arg("--no-timestamps");
+
+    // Language: "auto" means let whisper detect; otherwise specify
+    if language != "auto" {
+        cmd.arg("-l").arg(language);
+    }
+
+    cmd.arg("--no-prints");
+
+    let output = cmd
         .output()
         .await
         .map_err(|e| format!("Failed to run whisper-cli: {}", e))?;
