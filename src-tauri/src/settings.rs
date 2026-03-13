@@ -56,7 +56,16 @@ pub struct AppSettings {
     pub microphone_id: String,      // "" = system default
     pub vad_silence_threshold: f64, // RMS threshold
     pub vad_silence_frames: u32,    // frames of silence before auto-stop
+    #[serde(default = "default_transcription_mode")]
+    pub transcription_mode: String, // "local" or "cloud"
+    #[serde(default = "default_cloud_provider")]
+    pub cloud_provider: String,     // "openai" or "groq"
+    #[serde(default)]
+    pub cloud_api_key: String,      // API key for cloud provider
 }
+
+fn default_transcription_mode() -> String { "local".to_string() }
+fn default_cloud_provider() -> String { "openai".to_string() }
 
 impl Default for AppSettings {
     fn default() -> Self {
@@ -68,6 +77,9 @@ impl Default for AppSettings {
             microphone_id: String::new(),
             vad_silence_threshold: 0.015,
             vad_silence_frames: 45,
+            transcription_mode: "local".to_string(),
+            cloud_provider: "openai".to_string(),
+            cloud_api_key: String::new(),
         }
     }
 }

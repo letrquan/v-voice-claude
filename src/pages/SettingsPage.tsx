@@ -21,6 +21,9 @@ interface AppSettings {
   microphone_id: string;
   vad_silence_threshold: number;
   vad_silence_frames: number;
+  transcription_mode: string;
+  cloud_provider: string;
+  cloud_api_key: string;
 }
 
 const LANGUAGES = [
@@ -100,6 +103,7 @@ export default function SettingsPage() {
   const [capturingField, setCapturingField] = useState<"hotkey" | "quit_hotkey" | null>(null);
   const [saved, setSaved] = useState(false);
   const [dirty, setDirty] = useState(false);
+  const [showApiKey, setShowApiKey] = useState(false);
 
   // ─── Load initial data ───
   useEffect(() => {
@@ -239,66 +243,141 @@ export default function SettingsPage() {
       <div className="settings-container">
         <h1>V Voice Settings</h1>
 
-        {/* ─── Model Selection ─── */}
+        {/* ─── Transcription Mode ─── */}
         <section className="settings-section">
-          <h2>Whisper Model</h2>
-          <div className="model-grid">
-            {models.map((m) => {
-              const downloaded = downloadedModels.includes(m.id);
-              const isActive = settings.model === m.id;
-              const isDownloading = downloadingModel === m.id;
-
-              return (
-                <div
-                  key={m.id}
-                  className={`model-card ${isActive ? "active" : ""} ${downloaded ? "downloaded" : ""}`}
-                >
-                  <div className="model-card-header">
-                    <span className="model-label">{m.label}</span>
-                    <span className="model-size">{m.size_mb < 1000 ? `${m.size_mb} MB` : `${(m.size_mb / 1000).toFixed(1)} GB`}</span>
-                  </div>
-                  <div className="model-card-actions">
-                    {downloaded ? (
-                      <>
-                        <button
-                          className={`btn btn-sm ${isActive ? "btn-active" : "btn-select"}`}
-                          onClick={() => update({ model: m.id })}
-                          disabled={isActive}
-                        >
-                          {isActive ? "Active" : "Select"}
-                        </button>
-                        {!isActive && (
-                          <button
-                            className="btn btn-sm btn-danger"
-                            onClick={() => handleDeleteModel(m.id)}
-                          >
-                            Delete
-                          </button>
-                        )}
-                      </>
-                    ) : isDownloading ? (
-                      <div className="download-bar-inline">
-                        <div
-                          className="download-bar-fill"
-                          style={{ width: `${downloadProgress}%` }}
-                        />
-                        <span>{Math.round(downloadProgress)}%</span>
-                      </div>
-                    ) : (
-                      <button
-                        className="btn btn-sm btn-download"
-                        onClick={() => handleDownloadModel(m.id)}
-                        disabled={downloadingModel !== null}
-                      >
-                        Download
-                      </button>
-                    )}
-                  </div>
-                </div>
-              );
-            })}
+          <h2>Transcription Engine</h2>
+          <div className="mode-toggle">
+            <button
+              className={`mode-btn ${settings.transcription_mode === "local" ? "active" : ""}`}
+              onClick={() => update({ transcription_mode: "local" })}
+            >
+              <span className="mode-icon">💻</span>
+              <span className="mode-label">Local</span>
+              <span className="mode-desc">Whisper on your machine</span>
+            </button>
+            <button
+              className={`mode-btn ${settings.transcription_mode === "cloud" ? "active" : ""}`}
+              onClick={() => update({ transcription_mode: "cloud" })}
+            >
+              <span className="mode-icon">☁️</span>
+              <span className="mode-label">Cloud</span>
+              <span className="mode-desc">OpenAI / Groq API</span>
+            </button>
           </div>
         </section>
+
+        {/* ─── Cloud Config (only shown in cloud mode) ─── */}
+        {settings.transcription_mode === "cloud" && (
+          <section className="settings-section">
+            <h2>Cloud Provider</h2>
+            <div className="provider-grid">
+              <button
+                className={`provider-card ${settings.cloud_provider === "openai" ? "active" : ""}`}
+                onClick={() => update({ cloud_provider: "openai" })}
+              >
+                <span className="provider-name">OpenAI</span>
+                <span className="provider-desc">Whisper API · Accurate</span>
+              </button>
+              <button
+                className={`provider-card ${settings.cloud_provider === "groq" ? "active" : ""}`}
+                onClick={() => update({ cloud_provider: "groq" })}
+              >
+                <span className="provider-name">Groq</span>
+                <span className="provider-desc">Whisper v3 Turbo · Fast</span>
+              </button>
+            </div>
+
+            <div style={{ marginTop: 16 }}>
+              <h2>API Key</h2>
+              <div className="api-key-row">
+                <input
+                  type={showApiKey ? "text" : "password"}
+                  className="api-key-input"
+                  value={settings.cloud_api_key}
+                  onChange={(e) => update({ cloud_api_key: e.target.value })}
+                  placeholder={settings.cloud_provider === "groq" ? "gsk_..." : "sk-..."}
+                  spellCheck={false}
+                  autoComplete="off"
+                />
+                <button
+                  className="btn btn-sm btn-select"
+                  onClick={() => setShowApiKey(!showApiKey)}
+                  style={{ flexShrink: 0 }}
+                >
+                  {showApiKey ? "Hide" : "Show"}
+                </button>
+              </div>
+              <p className="hint" style={{ marginTop: 6 }}>
+                {settings.cloud_provider === "groq"
+                  ? "Get your free API key at console.groq.com"
+                  : "Get your API key at platform.openai.com"}
+              </p>
+            </div>
+          </section>
+        )}
+
+        {/* ─── Model Selection (only in local mode) ─── */}
+        {settings.transcription_mode === "local" && (
+          <section className="settings-section">
+            <h2>Whisper Model</h2>
+            <div className="model-grid">
+              {models.map((m) => {
+                const downloaded = downloadedModels.includes(m.id);
+                const isActive = settings.model === m.id;
+                const isDownloading = downloadingModel === m.id;
+
+                return (
+                  <div
+                    key={m.id}
+                    className={`model-card ${isActive ? "active" : ""} ${downloaded ? "downloaded" : ""}`}
+                  >
+                    <div className="model-card-header">
+                      <span className="model-label">{m.label}</span>
+                      <span className="model-size">{m.size_mb < 1000 ? `${m.size_mb} MB` : `${(m.size_mb / 1000).toFixed(1)} GB`}</span>
+                    </div>
+                    <div className="model-card-actions">
+                      {downloaded ? (
+                        <>
+                          <button
+                            className={`btn btn-sm ${isActive ? "btn-active" : "btn-select"}`}
+                            onClick={() => update({ model: m.id })}
+                            disabled={isActive}
+                          >
+                            {isActive ? "Active" : "Select"}
+                          </button>
+                          {!isActive && (
+                            <button
+                              className="btn btn-sm btn-danger"
+                              onClick={() => handleDeleteModel(m.id)}
+                            >
+                              Delete
+                            </button>
+                          )}
+                        </>
+                      ) : isDownloading ? (
+                        <div className="download-bar-inline">
+                          <div
+                            className="download-bar-fill"
+                            style={{ width: `${downloadProgress}%` }}
+                          />
+                          <span>{Math.round(downloadProgress)}%</span>
+                        </div>
+                      ) : (
+                        <button
+                          className="btn btn-sm btn-download"
+                          onClick={() => handleDownloadModel(m.id)}
+                          disabled={downloadingModel !== null}
+                        >
+                          Download
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </section>
+        )}
 
         {/* ─── Language ─── */}
         <section className="settings-section">

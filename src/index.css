@@ -594,6 +594,137 @@ html, body, #root {
   margin-bottom: 22px;
 }
 
+/* ─── Mode Toggle ─── */
+
+.mode-toggle {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.mode-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 16px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.02);
+  color: var(--text);
+  cursor: pointer;
+  transition: all 0.2s ease;
+  font-family: inherit;
+}
+
+.mode-btn:hover {
+  background: rgba(255, 255, 255, 0.05);
+  border-color: rgba(255, 255, 255, 0.15);
+}
+
+.mode-btn.active {
+  border-color: var(--accent2);
+  background: rgba(167, 139, 250, 0.06);
+  box-shadow: inset 0 0 0 1px rgba(167, 139, 250, 0.2);
+}
+
+.mode-icon {
+  font-size: 24px;
+  line-height: 1.2;
+}
+
+.mode-label {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.mode-desc {
+  font-size: 11px;
+  color: rgba(240, 238, 248, 0.4);
+}
+
+.mode-btn.active .mode-desc {
+  color: rgba(167, 139, 250, 0.7);
+}
+
+/* ─── Provider Grid ─── */
+
+.provider-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.provider-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 14px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.02);
+  color: var(--text);
+  cursor: pointer;
+  transition: all 0.2s ease;
+  font-family: inherit;
+}
+
+.provider-card:hover {
+  background: rgba(255, 255, 255, 0.05);
+  border-color: rgba(255, 255, 255, 0.15);
+}
+
+.provider-card.active {
+  border-color: var(--accent2);
+  background: rgba(167, 139, 250, 0.06);
+  box-shadow: inset 0 0 0 1px rgba(167, 139, 250, 0.2);
+}
+
+.provider-name {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.provider-desc {
+  font-size: 11px;
+  color: rgba(240, 238, 248, 0.4);
+}
+
+.provider-card.active .provider-desc {
+  color: rgba(167, 139, 250, 0.7);
+}
+
+/* ─── API Key Input ─── */
+
+.api-key-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.api-key-input {
+  flex: 1;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  outline: none;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.api-key-input:focus {
+  border-color: var(--accent2);
+  box-shadow: 0 0 0 2px rgba(167, 139, 250, 0.25);
+}
+
+.api-key-input::placeholder {
+  color: rgba(240, 238, 248, 0.2);
+}
+
 .settings-section select {
   width: 100%;
   padding: 10px 12px;

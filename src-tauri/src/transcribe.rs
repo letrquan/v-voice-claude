@@ -355,3 +355,119 @@ pub async fn transcribe_partial(
     let text = String::from_utf8_lossy(&output.stdout);
     Ok(text.trim().to_string())
 }
+
+/// Write samples to a WAV file in memory and return the bytes
+fn samples_to_wav_bytes(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>, String> {
+    let resampled = if sample_rate != WHISPER_SAMPLE_RATE {
+        resample(samples, sample_rate, WHISPER_SAMPLE_RATE)
+    } else {
+        samples.to_vec()
+    };
+
+    let mut cursor = Cursor::new(Vec::new());
+    {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: WHISPER_SAMPLE_RATE,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::new(&mut cursor, spec)
+            .map_err(|e| format!("Failed to create WAV writer: {}", e))?;
+
+        for &sample in &resampled {
+            let s = (sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
+            writer
+                .write_sample(s)
+                .map_err(|e| format!("WAV write error: {}", e))?;
+        }
+        writer
+            .finalize()
+            .map_err(|e| format!("WAV finalize error: {}", e))?;
+    }
+
+    Ok(cursor.into_inner())
+}
+
+/// Transcribe audio using a cloud API (OpenAI or Groq Whisper API)
+pub async fn transcribe_cloud(
+    samples: Vec<f32>,
+    sample_rate: u32,
+    language: &str,
+    provider: &str,
+    api_key: &str,
+) -> Result<String, String> {
+    if api_key.is_empty() {
+        return Err("API key not configured. Please add your API key in Settings.".to_string());
+    }
+
+    let wav_bytes = tokio::task::spawn_blocking({
+        let samples = samples.clone();
+        move || samples_to_wav_bytes(&samples, sample_rate)
+    })
+    .await
+    .map_err(|e| format!("WAV task error: {}", e))??;
+
+    // Determine endpoint and model based on provider
+    let (api_url, model_name) = match provider {
+        "groq" => (
+            "https://api.groq.com/openai/v1/audio/transcriptions",
+            "whisper-large-v3-turbo",
+        ),
+        _ => (
+            "https://api.openai.com/v1/audio/transcriptions",
+            "whisper-1",
+        ),
+    };
+
+    // Build multipart form
+    let file_part = reqwest::multipart::Part::bytes(wav_bytes)
+        .file_name("audio.wav")
+        .mime_str("audio/wav")
+        .map_err(|e| format!("Multipart error: {}", e))?;
+
+    let mut form = reqwest::multipart::Form::new()
+        .part("file", file_part)
+        .text("model", model_name.to_string())
+        .text("response_format", "json");
+
+    if language != "auto" {
+        form = form.text("language", language.to_string());
+    }
+
+    // Vietnamese-specific prompt
+    if language == "vi" {
+        form = form.text(
+            "prompt",
+            "Xin chào, đây là bản ghi âm tiếng Việt. Hãy chuyển đổi chính xác với dấu thanh đầy đủ.".to_string(),
+        );
+    }
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(api_url)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| format!("Cloud API request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("Cloud API error ({}): {}", status, body));
+    }
+
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse cloud response: {}", e))?;
+
+    let text = body["text"]
+        .as_str()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    Ok(text)
+}

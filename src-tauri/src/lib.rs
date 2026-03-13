@@ -38,7 +38,19 @@ async fn transcribe(
     state: tauri::State<'_, SettingsState>,
 ) -> Result<String, String> {
     let settings = state.0.lock().unwrap().clone();
-    transcribe::transcribe_audio(samples, sample_rate, &settings.model, &settings.language).await
+    if settings.transcription_mode == "cloud" {
+        transcribe::transcribe_cloud(
+            samples,
+            sample_rate,
+            &settings.language,
+            &settings.cloud_provider,
+            &settings.cloud_api_key,
+        )
+        .await
+    } else {
+        transcribe::transcribe_audio(samples, sample_rate, &settings.model, &settings.language)
+            .await
+    }
 }
 
 #[tauri::command]
@@ -48,7 +60,19 @@ async fn transcribe_streaming(
     state: tauri::State<'_, SettingsState>,
 ) -> Result<String, String> {
     let settings = state.0.lock().unwrap().clone();
-    transcribe::transcribe_partial(samples, sample_rate, &settings.model, &settings.language).await
+    if settings.transcription_mode == "cloud" {
+        transcribe::transcribe_cloud(
+            samples,
+            sample_rate,
+            &settings.language,
+            &settings.cloud_provider,
+            &settings.cloud_api_key,
+        )
+        .await
+    } else {
+        transcribe::transcribe_partial(samples, sample_rate, &settings.model, &settings.language)
+            .await
+    }
 }
 
 #[tauri::command]

@@ -17,6 +17,9 @@ interface AppSettings {
   microphone_id: string;
   vad_silence_threshold: number;
   vad_silence_frames: number;
+  transcription_mode: string;
+  cloud_provider: string;
+  cloud_api_key: string;
 }
 
 const DEFAULT_SETTINGS: AppSettings = {
@@ -27,6 +30,9 @@ const DEFAULT_SETTINGS: AppSettings = {
   microphone_id: "",
   vad_silence_threshold: 0.015,
   vad_silence_frames: 45,
+  transcription_mode: "local",
+  cloud_provider: "openai",
+  cloud_api_key: "",
 };
 
 const VAD_DEFAULTS = {
@@ -346,12 +352,15 @@ function App() {
         // Register hotkeys with loaded settings
         registerHotkeys(s).catch(console.error);
 
-        // Check model readiness
+        // Check model readiness (cloud mode is always ready)
+        if (s.transcription_mode === "cloud") {
+          return true;
+        }
         return invoke<boolean>("is_model_ready");
       })
       .then((ready) => {
         setModelReady(ready);
-        if (!ready) {
+        if (!ready && settingsRef.current.transcription_mode !== "cloud") {
           invoke("download_model")
             .then(() => setModelReady(true))
             .catch((e) => {
@@ -388,17 +397,21 @@ function App() {
           await registerHotkeys(s);
         }
 
-        // Re-check model if model changed
-        if (s.model !== oldSettings.model) {
-          const ready = await invoke<boolean>("is_model_ready");
-          setModelReady(ready);
-          if (!ready) {
-            invoke("download_model")
-              .then(() => setModelReady(true))
-              .catch((e) => {
-                console.error("Download error:", e);
-                setErrorMsg("Download failed. Click to retry.");
-              });
+        // Re-check model if model or mode changed
+        if (s.model !== oldSettings.model || s.transcription_mode !== oldSettings.transcription_mode) {
+          if (s.transcription_mode === "cloud") {
+            setModelReady(true);
+          } else {
+            const ready = await invoke<boolean>("is_model_ready");
+            setModelReady(ready);
+            if (!ready) {
+              invoke("download_model")
+                .then(() => setModelReady(true))
+                .catch((e) => {
+                  console.error("Download error:", e);
+                  setErrorMsg("Download failed. Click to retry.");
+                });
+            }
           }
         }
       } catch (e) {
