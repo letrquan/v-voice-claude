@@ -216,6 +216,16 @@ fn get_pill_position(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Auto-grant WebView2 microphone permission without showing a browser-style popup.
+    // --use-fake-ui-for-media-stream bypasses the permission dialog but still uses the real mic.
+    #[cfg(windows)]
+    {
+        let mut args = std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").unwrap_or_default();
+        if !args.is_empty() { args.push(' '); }
+        args.push_str("--autoplay-policy=no-user-gesture-required --use-fake-ui-for-media-stream");
+        std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", &args);
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_store::Builder::new().build())
