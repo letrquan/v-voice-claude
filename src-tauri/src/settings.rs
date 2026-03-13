@@ -46,6 +46,13 @@ pub fn available_models() -> Vec<ModelInfo> {
     ]
 }
 
+/// Saved pill position on a specific monitor (logical coordinates relative to monitor origin)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PillPosition {
+    pub x: f64,
+    pub y: f64,
+}
+
 /// Persistent settings schema
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
@@ -62,6 +69,8 @@ pub struct AppSettings {
     pub cloud_provider: String,     // "openai" or "groq"
     #[serde(default)]
     pub cloud_api_key: String,      // API key for cloud provider
+    #[serde(default)]
+    pub pill_positions: std::collections::HashMap<String, PillPosition>, // monitor fingerprint -> position
 }
 
 fn default_transcription_mode() -> String { "local".to_string() }
@@ -80,6 +89,7 @@ impl Default for AppSettings {
             transcription_mode: "local".to_string(),
             cloud_provider: "openai".to_string(),
             cloud_api_key: String::new(),
+            pill_positions: std::collections::HashMap::new(),
         }
     }
 }

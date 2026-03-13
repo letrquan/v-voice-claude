@@ -285,6 +285,10 @@ function App() {
       setIsSpeaking(false);
       await new Promise((r) => setTimeout(r, TRANSITION_MS));
       await resizeInPlace(SIZE_IDLE.w, SIZE_IDLE.h);
+
+      // Save pill position after settling back to idle
+      savePillPosition();
+
       setTimeout(() => setTranscript(""), 2000);
     }
   }, [start, stop, getBuffer]);
@@ -298,6 +302,38 @@ function App() {
   useEffect(() => {
     quitRef.current = handleQuit;
   }, [handleQuit]);
+
+  // ─── Save pill position (debounced) ───
+  const savePillTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const savePillPosition = useCallback(() => {
+    if (savePillTimerRef.current) clearTimeout(savePillTimerRef.current);
+    savePillTimerRef.current = setTimeout(async () => {
+      try {
+        const win = getCurrentWindow();
+        const pos = await win.outerPosition();
+        const factor = await win.scaleFactor();
+        const x = pos.x / factor;
+        const y = pos.y / factor;
+        await invoke("save_pill_position", { x, y });
+      } catch {
+        // Best effort
+      }
+    }, 500);
+  }, []);
+
+  // ─── Listen for window move (drag) to save position ───
+  useEffect(() => {
+    const win = getCurrentWindow();
+    const unlisten = win.onMoved(() => {
+      // Only save when idle (pill is at its natural position)
+      if (stateRef.current === "idle") {
+        savePillPosition();
+      }
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, [savePillPosition]);
 
   // ─── Retry download ───
   const handleRetry = useCallback(() => {

@@ -104,6 +104,116 @@ fn open_settings(app: tauri::AppHandle) {
     open_settings_window(&app);
 }
 
+/// Build a fingerprint string for a monitor: "name_widthxheight"
+fn monitor_fingerprint(monitor: &tauri::Monitor) -> String {
+    let size = monitor.size();
+    let name = monitor.name().map(|s| s.clone()).unwrap_or_else(|| "unknown".to_string());
+    format!("{}_{}×{}", name, size.width, size.height)
+}
+
+#[tauri::command]
+fn save_pill_position(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, SettingsState>,
+    x: f64,
+    y: f64,
+) -> Result<(), String> {
+    let win = app.get_webview_window("main")
+        .ok_or("Main window not found")?;
+
+    // Find which monitor the pill center is on
+    let monitors = win.available_monitors()
+        .map_err(|e| format!("Cannot list monitors: {}", e))?;
+
+    let _factor = win.scale_factor().unwrap_or(1.0);
+    let center_x = x + 24.0; // half of pill width (48)
+    let center_y = y + 24.0;
+
+    let mut best_monitor: Option<&tauri::Monitor> = None;
+    for mon in &monitors {
+        let pos = mon.position();
+        let size = mon.size();
+        let scale = mon.scale_factor();
+        let mx = pos.x as f64 / scale;
+        let my = pos.y as f64 / scale;
+        let mw = size.width as f64 / scale;
+        let mh = size.height as f64 / scale;
+
+        if center_x >= mx && center_x < mx + mw && center_y >= my && center_y < my + mh {
+            best_monitor = Some(mon);
+            break;
+        }
+    }
+
+    // Fallback to primary
+    let monitor = best_monitor.or_else(|| {
+        win.primary_monitor().ok().flatten().as_ref().and_then(|_| monitors.first())
+    });
+
+    if let Some(mon) = monitor {
+        let fp = monitor_fingerprint(mon);
+        let scale = mon.scale_factor();
+        let mon_x = mon.position().x as f64 / scale;
+        let mon_y = mon.position().y as f64 / scale;
+
+        // Store position relative to monitor origin
+        let rel_x = x - mon_x;
+        let rel_y = y - mon_y;
+
+        let mut settings = state.0.lock().unwrap();
+        settings.pill_positions.insert(
+            fp,
+            settings::PillPosition { x: rel_x, y: rel_y },
+        );
+        let settings_clone = settings.clone();
+        drop(settings);
+
+        // Persist (best effort)
+        let _ = save_pill_settings(&app, &settings_clone);
+    }
+
+    Ok(())
+}
+
+/// Helper to save just settings (without emitting settings-changed event)
+fn save_pill_settings(app: &tauri::AppHandle, settings: &settings::AppSettings) -> Result<(), String> {
+    use tauri_plugin_store::StoreExt;
+    let store = app.store("settings.json")
+        .map_err(|e| format!("Store error: {}", e))?;
+    let val = serde_json::to_value(settings)
+        .map_err(|e| format!("Serialize error: {}", e))?;
+    store.set("settings", val);
+    store.save().map_err(|e| format!("Save error: {}", e))?;
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct PillPositionResult {
+    x: f64,
+    y: f64,
+}
+
+#[tauri::command]
+fn get_pill_position(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, SettingsState>,
+) -> Option<PillPositionResult> {
+    let win = app.get_webview_window("main")?;
+    let monitor = win.primary_monitor().ok()??;
+    let fp = monitor_fingerprint(&monitor);
+    let scale = monitor.scale_factor();
+    let mon_x = monitor.position().x as f64 / scale;
+    let mon_y = monitor.position().y as f64 / scale;
+
+    let settings = state.0.lock().unwrap();
+    let pos = settings.pill_positions.get(&fp)?;
+
+    Some(PillPositionResult {
+        x: mon_x + pos.x,
+        y: mon_y + pos.y,
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -123,6 +233,8 @@ pub fn run() {
             settings::is_model_downloaded,
             settings::delete_model,
             open_settings,
+            save_pill_position,
+            get_pill_position,
         ])
         .setup(|app| {
             // ── Load settings into managed state ──
@@ -164,28 +276,57 @@ pub fn run() {
                 })
                 .build(app)?;
 
-            // ── Position main window at bottom-center ──
+            // ── Position main window ──
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_always_on_top(true);
 
+                // Try to restore saved position for this monitor
+                let loaded_settings = app.state::<SettingsState>().0.lock().unwrap().clone();
+                let mut restored = false;
+
                 if let Ok(Some(monitor)) = window.primary_monitor() {
-                    let screen_size = monitor.size();
-                    let screen_pos = monitor.position();
-                    let scale = monitor.scale_factor();
+                    let fp = monitor_fingerprint(&monitor);
+                    if let Some(pos) = loaded_settings.pill_positions.get(&fp) {
+                        let scale = monitor.scale_factor();
+                        let mon_x = monitor.position().x as f64 / scale;
+                        let mon_y = monitor.position().y as f64 / scale;
+                        let mon_w = monitor.size().width as f64 / scale;
+                        let mon_h = monitor.size().height as f64 / scale;
 
-                    let sw = screen_size.width as f64 / scale;
-                    let sh = screen_size.height as f64 / scale;
-                    let sx = screen_pos.x as f64 / scale;
-                    let sy = screen_pos.y as f64 / scale;
+                        let abs_x = mon_x + pos.x;
+                        let abs_y = mon_y + pos.y;
 
-                    let win_w = 48.0;
-                    let win_h = 48.0;
-                    let x = sx + (sw / 2.0) - (win_w / 2.0);
-                    let y = sy + sh - win_h - 24.0;
+                        // Validate position is still within monitor bounds
+                        if abs_x >= mon_x && abs_x < mon_x + mon_w - 24.0
+                            && abs_y >= mon_y && abs_y < mon_y + mon_h - 24.0
+                        {
+                            let _ = window.set_position(tauri::Position::Logical(
+                                tauri::LogicalPosition::new(abs_x, abs_y),
+                            ));
+                            restored = true;
+                        }
+                    }
 
-                    let _ = window.set_position(tauri::Position::Logical(
-                        tauri::LogicalPosition::new(x, y),
-                    ));
+                    // Fallback: bottom-center of primary monitor
+                    if !restored {
+                        let screen_size = monitor.size();
+                        let screen_pos = monitor.position();
+                        let scale = monitor.scale_factor();
+
+                        let sw = screen_size.width as f64 / scale;
+                        let sh = screen_size.height as f64 / scale;
+                        let sx = screen_pos.x as f64 / scale;
+                        let sy = screen_pos.y as f64 / scale;
+
+                        let win_w = 48.0;
+                        let win_h = 48.0;
+                        let x = sx + (sw / 2.0) - (win_w / 2.0);
+                        let y = sy + sh - win_h - 24.0;
+
+                        let _ = window.set_position(tauri::Position::Logical(
+                            tauri::LogicalPosition::new(x, y),
+                        ));
+                    }
                 }
             }
 
