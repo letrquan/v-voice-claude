@@ -231,6 +231,11 @@ pub async fn transcribe_audio(
     let wav_str = wav_path.to_str().unwrap();
 
     let mut cmd = tokio::process::Command::new(cli_str);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
     cmd.arg("-m").arg(model_str);
     cmd.arg("-f").arg(wav_str);
     cmd.arg("--no-timestamps");
@@ -324,6 +329,11 @@ pub async fn transcribe_partial(
     let wav_str = wav_path.to_str().unwrap();
 
     let mut cmd = tokio::process::Command::new(cli_str);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
     cmd.arg("-m").arg(model_str);
     cmd.arg("-f").arg(wav_str);
     cmd.arg("--no-timestamps");
