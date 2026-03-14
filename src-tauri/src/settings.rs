@@ -46,6 +46,31 @@ pub fn available_models() -> Vec<ModelInfo> {
     ]
 }
 
+/// Zipformer model info (Vietnamese-optimised, uses sherpa-onnx)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ZipformerModelInfo {
+    pub id: String,
+    pub label: String,
+    pub size_mb: u32,
+    pub encoder_url: String,
+    pub decoder_url: String,
+    pub joiner_url: String,
+    pub tokens_url: String,
+}
+
+pub fn zipformer_model() -> ZipformerModelInfo {
+    let base = "https://huggingface.co/hynt/Zipformer-30M-RNNT-6000h/resolve/main";
+    ZipformerModelInfo {
+        id: "zipformer-vi".to_string(),
+        label: "Zipformer 30M (Vietnamese)".to_string(),
+        size_mb: 30,
+        encoder_url: format!("{}/encoder-epoch-20-avg-10.int8.onnx", base),
+        decoder_url: format!("{}/decoder-epoch-20-avg-10.int8.onnx", base),
+        joiner_url: format!("{}/joiner-epoch-20-avg-10.int8.onnx", base),
+        tokens_url: format!("{}/config.json", base),
+    }
+}
+
 /// Saved pill position on a specific monitor (logical coordinates relative to monitor origin)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PillPosition {
@@ -71,10 +96,13 @@ pub struct AppSettings {
     pub cloud_api_key: String,      // API key for cloud provider
     #[serde(default)]
     pub pill_positions: std::collections::HashMap<String, PillPosition>, // monitor fingerprint -> position
+    #[serde(default = "default_local_engine")]
+    pub local_engine: String,       // "whisper" or "zipformer"
 }
 
 fn default_transcription_mode() -> String { "local".to_string() }
 fn default_cloud_provider() -> String { "openai".to_string() }
+fn default_local_engine() -> String { "whisper".to_string() }
 
 impl Default for AppSettings {
     fn default() -> Self {
@@ -90,6 +118,7 @@ impl Default for AppSettings {
             cloud_provider: "openai".to_string(),
             cloud_api_key: String::new(),
             pill_positions: std::collections::HashMap::new(),
+            local_engine: "whisper".to_string(),
         }
     }
 }
@@ -192,4 +221,22 @@ pub fn delete_model(model_id: String) -> Result<(), String> {
         std::fs::remove_file(&path).map_err(|e| format!("Failed to delete model: {}", e))?;
     }
     Ok(())
+}
+
+/// Get Zipformer model info
+#[tauri::command]
+pub fn get_zipformer_model() -> ZipformerModelInfo {
+    zipformer_model()
+}
+
+/// Check if Zipformer model files are downloaded
+#[tauri::command]
+pub fn is_zipformer_ready() -> bool {
+    let zf_dir = data_dir().join("models").join("zipformer-vi");
+    let sherpa = data_dir().join("bin").join("sherpa-onnx-streaming.exe");
+    zf_dir.join("encoder.int8.onnx").exists()
+        && zf_dir.join("decoder.int8.onnx").exists()
+        && zf_dir.join("joiner.int8.onnx").exists()
+        && zf_dir.join("tokens.txt").exists()
+        && sherpa.exists()
 }

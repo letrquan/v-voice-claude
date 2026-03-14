@@ -20,6 +20,7 @@ interface AppSettings {
   transcription_mode: string;
   cloud_provider: string;
   cloud_api_key: string;
+  local_engine: string;
 }
 
 const DEFAULT_SETTINGS: AppSettings = {
@@ -33,6 +34,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   transcription_mode: "local",
   cloud_provider: "openai",
   cloud_api_key: "",
+  local_engine: "whisper",
 };
 
 const VAD_DEFAULTS = {
@@ -367,7 +369,9 @@ function App() {
   const handleRetry = useCallback(() => {
     setErrorMsg("");
     setDownloadProgress(0);
-    invoke("download_model")
+    const s = settingsRef.current;
+    const downloadCmd = s.local_engine === "zipformer" ? "download_zipformer_model" : "download_model";
+    invoke(downloadCmd)
       .then(() => setModelReady(true))
       .catch((e) => {
         console.error("Retry download error:", e);
@@ -420,12 +424,16 @@ function App() {
         if (s.transcription_mode === "cloud") {
           return true;
         }
+        if (s.local_engine === "zipformer") {
+          return invoke<boolean>("is_zipformer_model_ready");
+        }
         return invoke<boolean>("is_model_ready");
       })
       .then((ready) => {
         setModelReady(ready);
         if (!ready && settingsRef.current.transcription_mode !== "cloud") {
-          invoke("download_model")
+          const downloadCmd = settingsRef.current.local_engine === "zipformer" ? "download_zipformer_model" : "download_model";
+          invoke(downloadCmd)
             .then(() => setModelReady(true))
             .catch((e) => {
               console.error("Download error:", e);
@@ -461,15 +469,17 @@ function App() {
           await registerHotkeys(s);
         }
 
-        // Re-check model if model or mode changed
-        if (s.model !== oldSettings.model || s.transcription_mode !== oldSettings.transcription_mode) {
+        // Re-check model if model, mode, or engine changed
+        if (s.model !== oldSettings.model || s.transcription_mode !== oldSettings.transcription_mode || s.local_engine !== oldSettings.local_engine) {
           if (s.transcription_mode === "cloud") {
             setModelReady(true);
           } else {
-            const ready = await invoke<boolean>("is_model_ready");
+            const readyCmd = s.local_engine === "zipformer" ? "is_zipformer_model_ready" : "is_model_ready";
+            const ready = await invoke<boolean>(readyCmd);
             setModelReady(ready);
             if (!ready) {
-              invoke("download_model")
+              const downloadCmd = s.local_engine === "zipformer" ? "download_zipformer_model" : "download_model";
+              invoke(downloadCmd)
                 .then(() => setModelReady(true))
                 .catch((e) => {
                   console.error("Download error:", e);

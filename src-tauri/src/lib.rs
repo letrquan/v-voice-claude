@@ -48,6 +48,8 @@ async fn transcribe(
             "",
         )
         .await
+    } else if settings.local_engine == "zipformer" {
+        transcribe::transcribe_zipformer(samples, sample_rate).await
     } else {
         transcribe::transcribe_audio(samples, sample_rate, &settings.model, &settings.language)
             .await
@@ -72,10 +74,24 @@ async fn transcribe_streaming(
             &prompt,
         )
         .await
+    } else if settings.local_engine == "zipformer" {
+        transcribe::transcribe_zipformer(samples, sample_rate).await
     } else {
         transcribe::transcribe_partial(samples, sample_rate, &settings.model, &settings.language, &prompt)
             .await
     }
+}
+
+#[tauri::command]
+async fn download_zipformer_model(
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    transcribe::download_zipformer(app).await
+}
+
+#[tauri::command]
+async fn is_zipformer_model_ready() -> Result<bool, String> {
+    Ok(transcribe::is_zipformer_ready())
 }
 
 #[tauri::command]
@@ -239,12 +255,16 @@ pub fn run() {
             transcribe,
             transcribe_streaming,
             type_text,
+            download_zipformer_model,
+            is_zipformer_model_ready,
             settings::get_settings,
             settings::set_settings,
             settings::get_available_models,
             settings::get_downloaded_models,
             settings::is_model_downloaded,
             settings::delete_model,
+            settings::get_zipformer_model,
+            settings::is_zipformer_ready,
             open_settings,
             save_pill_position,
             get_pill_position,

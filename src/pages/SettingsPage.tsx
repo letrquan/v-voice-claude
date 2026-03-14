@@ -24,6 +24,7 @@ interface AppSettings {
   transcription_mode: string;
   cloud_provider: string;
   cloud_api_key: string;
+  local_engine: string;
 }
 
 const LANGUAGES = [
@@ -104,6 +105,8 @@ export default function SettingsPage() {
   const [saved, setSaved] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [showApiKey, setShowApiKey] = useState(false);
+  const [zipformerReady, setZipformerReady] = useState(false);
+  const [downloadingZipformer, setDownloadingZipformer] = useState(false);
 
   // ─── Load initial data ───
   useEffect(() => {
@@ -111,10 +114,12 @@ export default function SettingsPage() {
       invoke<AppSettings>("get_settings"),
       invoke<ModelInfo[]>("get_available_models"),
       invoke<string[]>("get_downloaded_models"),
-    ]).then(([s, m, d]) => {
+      invoke<boolean>("is_zipformer_model_ready"),
+    ]).then(([s, m, d, zf]) => {
       setSettings(s);
       setModels(m);
       setDownloadedModels(d);
+      setZipformerReady(zf);
     });
 
     // Enumerate microphones
@@ -232,6 +237,21 @@ export default function SettingsPage() {
     []
   );
 
+  // ─── Download Zipformer model ───
+  const handleDownloadZipformer = useCallback(async () => {
+    setDownloadingZipformer(true);
+    setDownloadProgress(0);
+    try {
+      await invoke("download_zipformer_model");
+      const ready = await invoke<boolean>("is_zipformer_model_ready");
+      setZipformerReady(ready);
+    } catch (e) {
+      console.error("Zipformer download failed:", e);
+    } finally {
+      setDownloadingZipformer(false);
+    }
+  }, []);
+
   if (!settings) {
     return <div className="settings-page"><p>Loading...</p></div>;
   }
@@ -248,8 +268,8 @@ export default function SettingsPage() {
           <h2>Transcription Engine</h2>
           <div className="mode-toggle">
             <button
-              className={`mode-btn ${settings.transcription_mode === "local" ? "active" : ""}`}
-              onClick={() => update({ transcription_mode: "local" })}
+              className={`mode-btn ${settings.transcription_mode === "local" && settings.local_engine === "whisper" ? "active" : ""}`}
+              onClick={() => update({ transcription_mode: "local", local_engine: "whisper" })}
             >
               <span className="mode-icon">💻</span>
               <span className="mode-label">Local</span>
@@ -262,6 +282,14 @@ export default function SettingsPage() {
               <span className="mode-icon">☁️</span>
               <span className="mode-label">Cloud</span>
               <span className="mode-desc">OpenAI / Groq API</span>
+            </button>
+            <button
+              className={`mode-btn ${settings.transcription_mode === "local" && settings.local_engine === "zipformer" ? "active" : ""}`}
+              onClick={() => update({ transcription_mode: "local", local_engine: "zipformer", language: "vi" })}
+            >
+              <span className="mode-icon">🇻🇳</span>
+              <span className="mode-label">Zipformer</span>
+              <span className="mode-desc">Vietnamese · Ultra-fast</span>
             </button>
           </div>
         </section>
@@ -316,8 +344,8 @@ export default function SettingsPage() {
           </section>
         )}
 
-        {/* ─── Model Selection (only in local mode) ─── */}
-        {settings.transcription_mode === "local" && (
+        {/* ─── Model Selection (only in whisper local mode) ─── */}
+        {settings.transcription_mode === "local" && settings.local_engine === "whisper" && (
           <section className="settings-section">
             <h2>Whisper Model</h2>
             <div className="model-grid">
@@ -379,24 +407,68 @@ export default function SettingsPage() {
           </section>
         )}
 
+        {/* ─── Zipformer Model Download (only in zipformer mode) ─── */}
+        {settings.transcription_mode === "local" && settings.local_engine === "zipformer" && (
+          <section className="settings-section">
+            <h2>Zipformer Vietnamese Model</h2>
+            <div className={`model-card active ${zipformerReady ? "downloaded" : ""}`}>
+              <div className="model-card-header">
+                <span className="model-label">Zipformer 30M (Vietnamese)</span>
+                <span className="model-size">~30 MB (int8)</span>
+              </div>
+              <div className="model-card-actions">
+                {zipformerReady ? (
+                  <button className="btn btn-sm btn-active" disabled>
+                    ✅ Ready
+                  </button>
+                ) : downloadingZipformer ? (
+                  <div className="download-bar-inline">
+                    <div
+                      className="download-bar-fill"
+                      style={{ width: `${downloadProgress}%` }}
+                    />
+                    <span>{Math.round(downloadProgress)}%</span>
+                  </div>
+                ) : (
+                  <button
+                    className="btn btn-sm btn-download"
+                    onClick={handleDownloadZipformer}
+                  >
+                    Download
+                  </button>
+                )}
+              </div>
+            </div>
+            <p className="hint">
+              🏆 VLSP 2025 winner · 40× faster than Whisper · Trained on 6000h Vietnamese speech
+            </p>
+          </section>
+        )}
+
         {/* ─── Language ─── */}
         <section className="settings-section">
           <h2>Language</h2>
-          {isEnModel && settings.language === "en" && (
-            <p className="hint">Selecting a non-English language will auto-switch to a multilingual model.</p>
-          )}
-          <select
-            value={settings.language}
-            onChange={(e) => update({ language: e.target.value })}
-          >
-            {LANGUAGES.map((l) => (
-              <option key={l.code} value={l.code}>{l.label}</option>
-            ))}
-          </select>
-          {settings.language === "vi" && (
-            <p className="hint" style={{ marginTop: 8 }}>
-              💡 For best Vietnamese accuracy, use the <strong>Small</strong> or <strong>Medium</strong> multilingual model.
-            </p>
+          {settings.local_engine === "zipformer" && settings.transcription_mode === "local" ? (
+            <p className="hint">🇻🇳 Zipformer engine only supports Vietnamese. Switch to Whisper or Cloud for other languages.</p>
+          ) : (
+            <>
+              {isEnModel && settings.language === "en" && (
+                <p className="hint">Selecting a non-English language will auto-switch to a multilingual model.</p>
+              )}
+              <select
+                value={settings.language}
+                onChange={(e) => update({ language: e.target.value })}
+              >
+                {LANGUAGES.map((l) => (
+                  <option key={l.code} value={l.code}>{l.label}</option>
+                ))}
+              </select>
+              {settings.language === "vi" && settings.local_engine !== "zipformer" && (
+                <p className="hint" style={{ marginTop: 8 }}>
+                  💡 For best Vietnamese accuracy, try the <strong>Zipformer</strong> engine above!
+                </p>
+              )}
+            </>
           )}
         </section>
 

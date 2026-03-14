@@ -9,6 +9,10 @@ use crate::settings;
 const WHISPER_CLI_ZIP_URL: &str =
     "https://github.com/ggml-org/whisper.cpp/releases/download/v1.8.3/whisper-bin-x64.zip";
 
+const SHERPA_ONNX_PACKAGE_URL: &str =
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.12.29/sherpa-onnx-v1.12.29-win-x64-shared-MD-Release-no-tts.tar.bz2";
+const SHERPA_ONNX_PACKAGE_DIR: &str = "sherpa-onnx-v1.12.29-win-x64-shared-MD-Release-no-tts";
+
 const WHISPER_SAMPLE_RATE: u32 = 16000;
 
 /// Returns the base directory for all v-voice-claude data
@@ -233,7 +237,6 @@ pub async fn transcribe_audio(
     let mut cmd = tokio::process::Command::new(cli_str);
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
     cmd.arg("-m").arg(model_str);
@@ -332,7 +335,6 @@ pub async fn transcribe_partial(
     let mut cmd = tokio::process::Command::new(cli_str);
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
     cmd.arg("-m").arg(model_str);
@@ -498,4 +500,268 @@ pub async fn transcribe_cloud(
         .to_string();
 
     Ok(text)
+}
+
+// ─── Zipformer / sherpa-onnx support ───
+
+/// Path to the sherpa-onnx offline CLI
+fn sherpa_cli_path() -> PathBuf {
+    data_dir().join("bin").join("sherpa-onnx-offline.exe")
+}
+
+/// Directory containing Zipformer model files
+fn zipformer_model_dir() -> PathBuf {
+    data_dir().join("models").join("zipformer-vi")
+}
+
+/// Check if the Zipformer model and sherpa-onnx binary are available
+pub fn is_zipformer_ready() -> bool {
+    let dir = zipformer_model_dir();
+    sherpa_cli_path().exists()
+        && dir.join("encoder.int8.onnx").exists()
+        && dir.join("decoder.int8.onnx").exists()
+        && dir.join("joiner.int8.onnx").exists()
+        && dir.join("tokens.txt").exists()
+}
+
+/// Download the Zipformer Vietnamese model and sherpa-onnx CLI.
+pub async fn download_zipformer(app: tauri::AppHandle) -> Result<(), String> {
+    let model_dir = zipformer_model_dir();
+    let sherpa_cli = sherpa_cli_path();
+
+    if is_zipformer_ready() {
+        let _ = app.emit("download-progress", 100.0_f64);
+        return Ok(());
+    }
+
+    // Create directories
+    tokio::fs::create_dir_all(&model_dir)
+        .await
+        .map_err(|e| format!("Failed to create zipformer model dir: {}", e))?;
+
+    let bin_dir = data_dir().join("bin");
+    tokio::fs::create_dir_all(&bin_dir)
+        .await
+        .map_err(|e| format!("Failed to create bin dir: {}", e))?;
+
+    let model_info = settings::zipformer_model();
+
+    // Download model files (encoder, decoder, joiner, tokens)
+    let files = [
+        (&model_info.encoder_url, "encoder.int8.onnx"),
+        (&model_info.decoder_url, "decoder.int8.onnx"),
+        (&model_info.joiner_url, "joiner.int8.onnx"),
+        (&model_info.tokens_url, "tokens.txt"),
+    ];
+
+    let total_files = files.len() + 1; // +1 for sherpa-onnx CLI
+    for (i, (url, filename)) in files.iter().enumerate() {
+        let dest = model_dir.join(filename);
+        if !dest.exists() {
+            let base_progress = (i as f64 / total_files as f64) * 100.0;
+            let _ = app.emit("download-progress", base_progress);
+
+            let bytes = download_bytes(&app, url, filename).await?;
+            tokio::fs::write(&dest, &bytes)
+                .await
+                .map_err(|e| format!("Failed to save {}: {}", filename, e))?;
+        }
+    }
+
+    // Download sherpa-onnx shared library package (contains CLI binary + DLLs)
+    if !sherpa_cli.exists() {
+        let base_progress = (files.len() as f64 / total_files as f64) * 100.0;
+        let _ = app.emit("download-progress", base_progress);
+
+        // Download tar.bz2 to temp
+        let temp_dir = std::env::temp_dir();
+        let archive_path = temp_dir.join("sherpa-onnx-package.tar.bz2");
+        let extract_dir = temp_dir.join("sherpa-onnx-extract");
+
+        let bytes = download_bytes(&app, SHERPA_ONNX_PACKAGE_URL, "sherpa-onnx").await?;
+        tokio::fs::write(&archive_path, &bytes)
+            .await
+            .map_err(|e| format!("Failed to save sherpa-onnx archive: {}", e))?;
+
+        // Extract using system tar (available on Windows 10+)
+        let _ = tokio::fs::remove_dir_all(&extract_dir).await;
+        tokio::fs::create_dir_all(&extract_dir)
+            .await
+            .map_err(|e| format!("Failed to create extract dir: {}", e))?;
+
+        let mut tar_cmd = tokio::process::Command::new("tar");
+        tar_cmd.arg("-xf")
+            .arg(archive_path.to_str().unwrap())
+            .arg("-C")
+            .arg(extract_dir.to_str().unwrap());
+        #[cfg(windows)]
+        {
+            tar_cmd.creation_flags(0x08000000);
+        }
+        let tar_output = tar_cmd.output().await
+            .map_err(|e| format!("Failed to run tar: {}", e))?;
+        if !tar_output.status.success() {
+            let stderr = String::from_utf8_lossy(&tar_output.stderr);
+            return Err(format!("Failed to extract sherpa-onnx package: {}", stderr));
+        }
+
+        // Copy sherpa-onnx-offline.exe from bin/ directory
+        let extracted_root = extract_dir.join(SHERPA_ONNX_PACKAGE_DIR);
+        let exe_src = extracted_root.join("bin").join("sherpa-onnx-offline.exe");
+        if exe_src.exists() {
+            tokio::fs::copy(&exe_src, &sherpa_cli)
+                .await
+                .map_err(|e| format!("Failed to copy sherpa-onnx-offline.exe: {}", e))?;
+        } else {
+            // Try sherpa-onnx.exe as fallback (streaming version)
+            let streaming_src = extracted_root.join("bin").join("sherpa-onnx.exe");
+            if streaming_src.exists() {
+                tokio::fs::copy(&streaming_src, &sherpa_cli)
+                    .await
+                    .map_err(|e| format!("Failed to copy sherpa-onnx.exe: {}", e))?;
+            } else {
+                return Err("sherpa-onnx-offline.exe not found in extracted package".to_string());
+            }
+        }
+
+        // Copy all DLLs from lib/ to bin/ (needed at runtime)
+        let lib_dir = extracted_root.join("lib");
+        if lib_dir.exists() {
+            let mut entries = tokio::fs::read_dir(&lib_dir)
+                .await
+                .map_err(|e| format!("Failed to read lib dir: {}", e))?;
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let name = entry.file_name();
+                if let Some(n) = name.to_str() {
+                    if n.ends_with(".dll") {
+                        let _ = tokio::fs::copy(entry.path(), bin_dir.join(&name)).await;
+                    }
+                }
+            }
+        }
+
+        // Also copy DLLs from bin/ directory (some builds put DLLs there)
+        let extracted_bin_dir = extracted_root.join("bin");
+        if extracted_bin_dir.exists() {
+            let mut entries = tokio::fs::read_dir(&extracted_bin_dir)
+                .await
+                .map_err(|e| format!("Failed to read extracted bin dir: {}", e))?;
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let name = entry.file_name();
+                if let Some(n) = name.to_str() {
+                    if n.ends_with(".dll") {
+                        let _ = tokio::fs::copy(entry.path(), bin_dir.join(&name)).await;
+                    }
+                }
+            }
+        }
+
+        // Cleanup temp files
+        let _ = tokio::fs::remove_file(&archive_path).await;
+        let _ = tokio::fs::remove_dir_all(&extract_dir).await;
+    }
+
+    let _ = app.emit("download-progress", 100.0_f64);
+    Ok(())
+}
+
+/// Transcribe audio using the Zipformer model via sherpa-onnx CLI.
+pub async fn transcribe_zipformer(
+    samples: Vec<f32>,
+    sample_rate: u32,
+) -> Result<String, String> {
+    let sherpa = sherpa_cli_path();
+    let model_dir = zipformer_model_dir();
+
+    if !is_zipformer_ready() {
+        return Err("Zipformer model or sherpa-onnx not ready".to_string());
+    }
+
+    // Resample to 16kHz if needed
+    let audio_data = if sample_rate != WHISPER_SAMPLE_RATE {
+        resample(&samples, sample_rate, WHISPER_SAMPLE_RATE)
+    } else {
+        samples
+    };
+
+    // Write audio to a temporary WAV file
+    let temp_dir = std::env::temp_dir();
+    let wav_path = temp_dir.join("v-voice-zipformer.wav");
+
+    let wav_path_clone = wav_path.clone();
+    tokio::task::spawn_blocking(move || {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: WHISPER_SAMPLE_RATE,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&wav_path_clone, spec)
+            .map_err(|e| format!("Failed to create WAV file: {}", e))?;
+
+        for &sample in &audio_data {
+            let s = (sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
+            writer.write_sample(s)
+                .map_err(|e| format!("WAV write error: {}", e))?;
+        }
+        writer.finalize()
+            .map_err(|e| format!("WAV finalize error: {}", e))?;
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|e| format!("WAV write task error: {}", e))??;
+
+    // Build sherpa-onnx command
+    let mut cmd = tokio::process::Command::new(sherpa.to_str().unwrap());
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+
+    cmd.arg("--transducer-encoder").arg(model_dir.join("encoder.int8.onnx").to_str().unwrap());
+    cmd.arg("--transducer-decoder").arg(model_dir.join("decoder.int8.onnx").to_str().unwrap());
+    cmd.arg("--transducer-joiner").arg(model_dir.join("joiner.int8.onnx").to_str().unwrap());
+    cmd.arg("--tokens").arg(model_dir.join("tokens.txt").to_str().unwrap());
+    cmd.arg(wav_path.to_str().unwrap());
+
+    let output = cmd
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run sherpa-onnx: {}", e))?;
+
+    // Clean up temp file
+    let _ = tokio::fs::remove_file(&wav_path).await;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("sherpa-onnx failed: {}", stderr));
+    }
+
+    // Parse sherpa-onnx output — it prints the filename then the recognized text
+    let raw = String::from_utf8_lossy(&output.stdout);
+    // The output format is typically:
+    //   /path/to/file.wav
+    //   recognized text here
+    // We want just the recognized text (skip lines that look like file paths)
+    let text: String = raw
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !trimmed.is_empty()
+                && !trimmed.ends_with(".wav")
+                && !trimmed.starts_with('/')
+                && !trimmed.starts_with("----")
+                && !trimmed.contains("v-voice-zipformer")
+                && !trimmed.contains(":\\") // Windows absolute paths like C:\
+                && !trimmed.starts_with("Duration")
+                && !trimmed.starts_with("Wave duration")
+                && !trimmed.starts_with("Elapsed")
+                && !trimmed.starts_with("Real time factor")
+                && !trimmed.starts_with("NumThreads")
+                && !trimmed.starts_with("num_threads")
+        })
+        .collect::<Vec<&str>>()
+        .join(" ");
+
+    Ok(text.trim().to_string())
 }
