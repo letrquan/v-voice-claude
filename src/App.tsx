@@ -48,7 +48,9 @@ const SIZE_TALL = { w: 260, h: 100 };
 /* ─── Timing ─── */
 const TRANSITION_MS = 420;
 const SHOW_TRANSCRIPT_DELAY = 300;
-const STREAMING_INTERVAL_MS = 2000; // partial transcription every 2s
+const STREAMING_CHUNK_MS = 3500; // consume + transcribe every 3.5s
+const MIN_CHUNK_DURATION = 0.75; // minimum seconds of audio per chunk
+const MIN_FINAL_CHUNK_DURATION = 0.25; // minimum seconds for the final chunk
 
 /**
  * Resize the window while keeping its visual center-x and bottom-y anchored.
@@ -96,11 +98,12 @@ function App() {
   const isSpeakingRef = useRef(false);
   const vadWarmupUntilRef = useRef(0); // timestamp: ignore VAD auto-stop until this time
 
-  const { start, stop, getBuffer, analyserNode } = useAudioCapture();
+  const { start, stop, consumeBuffer, analyserNode } = useAudioCapture();
 
   // Streaming transcription refs
   const streamingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const streamingBusyRef = useRef(false);
+  const committedTextRef = useRef("");
 
   useEffect(() => {
     stateRef.current = state;
@@ -172,6 +175,7 @@ function App() {
         streamingIntervalRef.current = null;
       }
       streamingBusyRef.current = false;
+      committedTextRef.current = "";
 
       await stop();
       setState("idle");
@@ -224,29 +228,39 @@ function App() {
         }
       }, SHOW_TRANSCRIPT_DELAY);
 
-      // ─── Start streaming partial transcription ───
+      // ─── Start chunked streaming (transcribe + type directly) ───
+      committedTextRef.current = "";
       streamingIntervalRef.current = setInterval(async () => {
         if (stateRef.current !== "listening") return;
         if (streamingBusyRef.current) return;
 
-        const buf = getBuffer();
-        if (!buf || buf.samples.length < 8000) return; // need ~0.5s of audio minimum
+        const buf = consumeBuffer();
+        if (!buf || buf.samples.length < buf.sampleRate * MIN_CHUNK_DURATION) return;
 
         streamingBusyRef.current = true;
         try {
-          const partial = await invoke<string>("transcribe_streaming", {
+          const chunkText = await invoke<string>("transcribe_streaming", {
             samples: Array.from(buf.samples),
             sampleRate: buf.sampleRate,
+            prompt: committedTextRef.current,
           });
-          if (partial && partial.trim() && stateRef.current === "listening") {
-            setTranscript(partial.trim());
+          if (chunkText && chunkText.trim() && stateRef.current === "listening") {
+            const trimmed = chunkText.trim();
+            const textToType = committedTextRef.current ? " " + trimmed : trimmed;
+
+            // Type directly into active textbox
+            await invoke("type_text", { text: textToType });
+
+            // Track committed text
+            committedTextRef.current += textToType;
+            setTranscript(committedTextRef.current);
           }
         } catch {
-          // Partial failures are non-critical, just skip
+          // Non-critical, skip this chunk
         } finally {
           streamingBusyRef.current = false;
         }
-      }, STREAMING_INTERVAL_MS);
+      }, STREAMING_CHUNK_MS);
 
     } else if (currentState === "listening") {
       // ─── Stop streaming interval ───
@@ -254,27 +268,38 @@ function App() {
         clearInterval(streamingIntervalRef.current);
         streamingIntervalRef.current = null;
       }
-      streamingBusyRef.current = false;
 
       setState("processing");
       stateRef.current = "processing";
 
-      const audioData = await stop();
+      // Wait for any in-progress streaming transcription to complete
+      let waitCount = 0;
+      while (streamingBusyRef.current && waitCount < 50) {
+        await new Promise((r) => setTimeout(r, 100));
+        waitCount++;
+      }
+      streamingBusyRef.current = false;
 
-      if (audioData && audioData.samples.length > 0) {
+      // Stop audio capture — returns remaining audio since last consume
+      const remainingAudio = await stop();
+
+      // Transcribe and type remaining audio
+      if (remainingAudio && remainingAudio.samples.length > remainingAudio.sampleRate * MIN_FINAL_CHUNK_DURATION) {
         try {
-          const result = await invoke<string>("transcribe", {
-            samples: Array.from(audioData.samples),
-            sampleRate: audioData.sampleRate,
+          const chunkText = await invoke<string>("transcribe_streaming", {
+            samples: Array.from(remainingAudio.samples),
+            sampleRate: remainingAudio.sampleRate,
+            prompt: committedTextRef.current,
           });
-          if (result.trim()) {
-            setTranscript(result.trim());
-            await new Promise((r) => setTimeout(r, 400));
-            await invoke("type_text", { text: result.trim() });
+          if (chunkText && chunkText.trim()) {
+            const trimmed = chunkText.trim();
+            const textToType = committedTextRef.current ? " " + trimmed : trimmed;
+            await invoke("type_text", { text: textToType });
+            committedTextRef.current += textToType;
+            setTranscript(committedTextRef.current);
           }
         } catch (e) {
-          console.error("Transcription error:", e);
-          setTranscript("");
+          console.error("Final chunk transcription error:", e);
           setErrorMsg(String(e));
         }
       }
@@ -289,9 +314,12 @@ function App() {
       // Save pill position after settling back to idle
       savePillPosition();
 
-      setTimeout(() => setTranscript(""), 2000);
+      setTimeout(() => {
+        setTranscript("");
+        committedTextRef.current = "";
+      }, 2000);
     }
-  }, [start, stop, getBuffer]);
+  }, [start, stop, consumeBuffer]);
 
   const toggleRef = useRef(handleToggle);
   useEffect(() => {
@@ -583,7 +611,7 @@ function App() {
           {errorMsg && state !== "idle" ? (
             <span className="tx-error">{errorMsg}</span>
           ) : state === "processing" ? (
-            <span className="tx-pending">processing...</span>
+            <span className="tx-pending">finalizing...</span>
           ) : transcript && state === "listening" ? (
             <span className="tx-streaming">{transcript.slice(-80)}<span className="tx-cursor">|</span></span>
           ) : transcript ? (

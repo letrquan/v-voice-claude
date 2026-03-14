@@ -95,6 +95,32 @@ export function useAudioCapture() {
     return { samples: allSamples, sampleRate };
   }, []);
 
+  /** Consume the accumulated audio buffer, returning it and clearing it.
+   *  New audio chunks arriving after this call start a fresh buffer.
+   */
+  const consumeBuffer = useCallback((): AudioData | null => {
+    if (!audioContextRef.current || samplesRef.current.length === 0) return null;
+
+    const sampleRate = audioContextRef.current.sampleRate;
+    const totalLength = samplesRef.current.reduce(
+      (sum, chunk) => sum + chunk.length,
+      0
+    );
+    if (totalLength === 0) return null;
+
+    const allSamples = new Float32Array(totalLength);
+    let offset = 0;
+    for (const chunk of samplesRef.current) {
+      allSamples.set(chunk, offset);
+      offset += chunk.length;
+    }
+
+    // Clear buffer — new audio will accumulate from here
+    samplesRef.current = [];
+
+    return { samples: allSamples, sampleRate };
+  }, []);
+
   const stop = useCallback(async (): Promise<AudioData | null> => {
     if (!audioContextRef.current || !workletNodeRef.current) return null;
 
@@ -135,5 +161,5 @@ export function useAudioCapture() {
     return { samples: allSamples, sampleRate };
   }, []);
 
-  return { start, stop, getBuffer, analyserNode, isCapturing };
+  return { start, stop, getBuffer, consumeBuffer, analyserNode, isCapturing };
 }

@@ -45,6 +45,7 @@ async fn transcribe(
             &settings.language,
             &settings.cloud_provider,
             &settings.cloud_api_key,
+            "",
         )
         .await
     } else {
@@ -57,6 +58,7 @@ async fn transcribe(
 async fn transcribe_streaming(
     samples: Vec<f32>,
     sample_rate: u32,
+    prompt: String,
     state: tauri::State<'_, SettingsState>,
 ) -> Result<String, String> {
     let settings = state.0.lock().unwrap().clone();
@@ -67,10 +69,11 @@ async fn transcribe_streaming(
             &settings.language,
             &settings.cloud_provider,
             &settings.cloud_api_key,
+            &prompt,
         )
         .await
     } else {
-        transcribe::transcribe_partial(samples, sample_rate, &settings.model, &settings.language)
+        transcribe::transcribe_partial(samples, sample_rate, &settings.model, &settings.language, &prompt)
             .await
     }
 }

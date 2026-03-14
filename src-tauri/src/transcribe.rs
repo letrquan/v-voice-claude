@@ -279,6 +279,7 @@ pub async fn transcribe_partial(
     sample_rate: u32,
     model_id: &str,
     language: &str,
+    prompt: &str,
 ) -> Result<String, String> {
     let model = model_path(model_id);
     let cli = cli_path();
@@ -342,10 +343,19 @@ pub async fn transcribe_partial(
         cmd.arg("-l").arg(language);
     }
 
-    if language == "vi" {
-        cmd.arg("--prompt").arg(
-            "Xin chào, đây là bản ghi âm tiếng Việt. Hãy chuyển đổi chính xác với dấu thanh đầy đủ."
-        );
+    // Build prompt: combine Vietnamese hint with context from previous chunks
+    let prompt_text = if language == "vi" {
+        if prompt.is_empty() {
+            "Xin chào, đây là bản ghi âm tiếng Việt. Hãy chuyển đổi chính xác với dấu thanh đầy đủ.".to_string()
+        } else {
+            format!("Xin chào, tiếng Việt. {}", prompt)
+        }
+    } else {
+        prompt.to_string()
+    };
+
+    if !prompt_text.is_empty() {
+        cmd.arg("--prompt").arg(&prompt_text);
     }
 
     cmd.arg("--no-prints");
@@ -406,6 +416,7 @@ pub async fn transcribe_cloud(
     language: &str,
     provider: &str,
     api_key: &str,
+    prompt: &str,
 ) -> Result<String, String> {
     if api_key.is_empty() {
         return Err("API key not configured. Please add your API key in Settings.".to_string());
@@ -445,12 +456,19 @@ pub async fn transcribe_cloud(
         form = form.text("language", language.to_string());
     }
 
-    // Vietnamese-specific prompt
-    if language == "vi" {
-        form = form.text(
-            "prompt",
-            "Xin chào, đây là bản ghi âm tiếng Việt. Hãy chuyển đổi chính xác với dấu thanh đầy đủ.".to_string(),
-        );
+    // Build prompt: combine Vietnamese hint with context from previous chunks
+    let prompt_text = if language == "vi" {
+        if prompt.is_empty() {
+            "Xin chào, đây là bản ghi âm tiếng Việt. Hãy chuyển đổi chính xác với dấu thanh đầy đủ.".to_string()
+        } else {
+            format!("Xin chào, tiếng Việt. {}", prompt)
+        }
+    } else {
+        prompt.to_string()
+    };
+
+    if !prompt_text.is_empty() {
+        form = form.text("prompt", prompt_text);
     }
 
     let client = reqwest::Client::new();
