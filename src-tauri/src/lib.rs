@@ -50,6 +50,14 @@ async fn transcribe(
         .await
     } else if settings.local_engine == "zipformer" {
         transcribe::transcribe_zipformer(samples, sample_rate).await
+    } else if settings.local_engine == "granite" {
+        transcribe::transcribe_granite(
+            samples,
+            sample_rate,
+            settings.granite_api_port,
+            &settings.language,
+        )
+        .await
     } else {
         transcribe::transcribe_audio(samples, sample_rate, &settings.model, &settings.language)
             .await
@@ -76,6 +84,14 @@ async fn transcribe_streaming(
         .await
     } else if settings.local_engine == "zipformer" {
         transcribe::transcribe_zipformer(samples, sample_rate).await
+    } else if settings.local_engine == "granite" {
+        transcribe::transcribe_granite(
+            samples,
+            sample_rate,
+            settings.granite_api_port,
+            &settings.language,
+        )
+        .await
     } else {
         transcribe::transcribe_partial(samples, sample_rate, &settings.model, &settings.language, &prompt)
             .await
@@ -92,6 +108,42 @@ async fn download_zipformer_model(
 #[tauri::command]
 async fn is_zipformer_model_ready() -> Result<bool, String> {
     Ok(transcribe::is_zipformer_ready())
+}
+
+#[tauri::command]
+async fn download_granite_model(
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    transcribe::download_granite(app).await
+}
+
+#[tauri::command]
+async fn is_granite_model_ready() -> Result<bool, String> {
+    Ok(transcribe::is_granite_ready())
+}
+
+#[tauri::command]
+async fn start_granite_server(
+    state: tauri::State<'_, SettingsState>,
+) -> Result<(), String> {
+    let port = state.0.lock().unwrap().granite_api_port;
+    transcribe::start_granite_server(port).await
+}
+
+#[tauri::command]
+async fn stop_granite_server(
+    state: tauri::State<'_, SettingsState>,
+) -> Result<(), String> {
+    let port = state.0.lock().unwrap().granite_api_port;
+    transcribe::stop_granite_server(port).await
+}
+
+#[tauri::command]
+async fn is_granite_server_running(
+    state: tauri::State<'_, SettingsState>,
+) -> Result<bool, String> {
+    let port = state.0.lock().unwrap().granite_api_port;
+    Ok(transcribe::is_granite_server_running(port).await)
 }
 
 #[tauri::command]
@@ -257,6 +309,11 @@ pub fn run() {
             type_text,
             download_zipformer_model,
             is_zipformer_model_ready,
+            download_granite_model,
+            is_granite_model_ready,
+            start_granite_server,
+            stop_granite_server,
+            is_granite_server_running,
             settings::get_settings,
             settings::set_settings,
             settings::get_available_models,
@@ -265,6 +322,8 @@ pub fn run() {
             settings::delete_model,
             settings::get_zipformer_model,
             settings::is_zipformer_ready,
+            settings::get_granite_model,
+            settings::is_granite_ready,
             open_settings,
             save_pill_position,
             get_pill_position,

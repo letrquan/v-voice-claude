@@ -25,6 +25,7 @@ interface AppSettings {
   cloud_provider: string;
   cloud_api_key: string;
   local_engine: string;
+  granite_api_port: number;
 }
 
 const LANGUAGES = [
@@ -107,6 +108,9 @@ export default function SettingsPage() {
   const [showApiKey, setShowApiKey] = useState(false);
   const [zipformerReady, setZipformerReady] = useState(false);
   const [downloadingZipformer, setDownloadingZipformer] = useState(false);
+  const [graniteReady, setGraniteReady] = useState(false);
+  const [downloadingGranite, setDownloadingGranite] = useState(false);
+  const [graniteServerRunning, setGraniteServerRunning] = useState(false);
 
   // ─── Load initial data ───
   useEffect(() => {
@@ -115,11 +119,15 @@ export default function SettingsPage() {
       invoke<ModelInfo[]>("get_available_models"),
       invoke<string[]>("get_downloaded_models"),
       invoke<boolean>("is_zipformer_model_ready"),
-    ]).then(([s, m, d, zf]) => {
+      invoke<boolean>("is_granite_model_ready"),
+      invoke<boolean>("is_granite_server_running"),
+    ]).then(([s, m, d, zf, gr, gs]) => {
       setSettings(s);
       setModels(m);
       setDownloadedModels(d);
       setZipformerReady(zf);
+      setGraniteReady(gr);
+      setGraniteServerRunning(gs);
     });
 
     // Enumerate microphones
@@ -252,6 +260,41 @@ export default function SettingsPage() {
     }
   }, []);
 
+  // ─── Download Granite model ───
+  const handleDownloadGranite = useCallback(async () => {
+    setDownloadingGranite(true);
+    setDownloadProgress(0);
+    try {
+      await invoke("download_granite_model");
+      const ready = await invoke<boolean>("is_granite_model_ready");
+      setGraniteReady(ready);
+    } catch (e) {
+      console.error("Granite download failed:", e);
+    } finally {
+      setDownloadingGranite(false);
+    }
+  }, []);
+
+  // ─── Start Granite server ───
+  const handleStartGraniteServer = useCallback(async () => {
+    try {
+      await invoke("start_granite_server");
+      setGraniteServerRunning(true);
+    } catch (e) {
+      console.error("Granite server start failed:", e);
+    }
+  }, []);
+
+  // ─── Stop Granite server ───
+  const handleStopGraniteServer = useCallback(async () => {
+    try {
+      await invoke("stop_granite_server");
+      setGraniteServerRunning(false);
+    } catch (e) {
+      console.error("Granite server stop failed:", e);
+    }
+  }, []);
+
   if (!settings) {
     return <div className="settings-page"><p>Loading...</p></div>;
   }
@@ -290,6 +333,14 @@ export default function SettingsPage() {
               <span className="mode-icon">🇻🇳</span>
               <span className="mode-label">Zipformer</span>
               <span className="mode-desc">Vietnamese · Ultra-fast</span>
+            </button>
+            <button
+              className={`mode-btn ${settings.transcription_mode === "local" && settings.local_engine === "granite" ? "active" : ""}`}
+              onClick={() => update({ transcription_mode: "local", local_engine: "granite" })}
+            >
+              <span className="mode-icon">🪨</span>
+              <span className="mode-label">Granite</span>
+              <span className="mode-desc">IBM · Multilingual</span>
             </button>
           </div>
         </section>
@@ -445,11 +496,91 @@ export default function SettingsPage() {
           </section>
         )}
 
+        {/* ─── Granite Model Download (only in granite mode) ─── */}
+        {settings.transcription_mode === "local" && settings.local_engine === "granite" && (
+          <section className="settings-section">
+            <h2>Granite 4.0 1B Speech</h2>
+            <div className={`model-card active ${graniteReady ? "downloaded" : ""}`}>
+              <div className="model-card-header">
+                <span className="model-label">Granite 4.0 1B Speech (IBM)</span>
+                <span className="model-size">~2 GB</span>
+              </div>
+              <div className="model-card-actions">
+                {graniteReady ? (
+                  <button className="btn btn-sm btn-active" disabled>
+                    ✅ Downloaded
+                  </button>
+                ) : downloadingGranite ? (
+                  <div className="download-bar-inline">
+                    <div
+                      className="download-bar-fill"
+                      style={{ width: `${downloadProgress}%` }}
+                    />
+                    <span>{Math.round(downloadProgress)}%</span>
+                  </div>
+                ) : (
+                  <button
+                    className="btn btn-sm btn-download"
+                    onClick={handleDownloadGranite}
+                  >
+                    Download
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* Server status */}
+            {graniteReady && (
+              <div style={{ marginTop: 12 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+                  <span style={{
+                    display: "inline-block",
+                    width: 10,
+                    height: 10,
+                    borderRadius: "50%",
+                    background: graniteServerRunning ? "#22c55e" : "#ef4444",
+                    boxShadow: graniteServerRunning ? "0 0 6px #22c55e" : "0 0 6px #ef4444",
+                  }} />
+                  <span style={{ fontSize: 13, opacity: 0.8 }}>
+                    Server {graniteServerRunning ? "running" : "stopped"}
+                  </span>
+                  {graniteServerRunning ? (
+                    <button
+                      className="btn btn-sm btn-danger"
+                      onClick={handleStopGraniteServer}
+                      style={{ marginLeft: "auto" }}
+                    >
+                      Stop Server
+                    </button>
+                  ) : (
+                    <button
+                      className="btn btn-sm btn-download"
+                      onClick={handleStartGraniteServer}
+                      style={{ marginLeft: "auto" }}
+                    >
+                      Start Server
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+
+            <p className="hint">
+              🌐 Multilingual ASR · EN, FR, DE, ES, PT, JA · Requires Python + PyTorch
+            </p>
+            <p className="hint" style={{ marginTop: 4, fontSize: 11 }}>
+              Prerequisites: <code>pip install -r scripts/requirements.txt</code>
+            </p>
+          </section>
+        )}
+
         {/* ─── Language ─── */}
         <section className="settings-section">
           <h2>Language</h2>
           {settings.local_engine === "zipformer" && settings.transcription_mode === "local" ? (
             <p className="hint">🇻🇳 Zipformer engine only supports Vietnamese. Switch to Whisper or Cloud for other languages.</p>
+          ) : settings.local_engine === "granite" && settings.transcription_mode === "local" ? (
+            <p className="hint">🌐 Granite supports: English, French, German, Spanish, Portuguese, Japanese</p>
           ) : (
             <>
               {isEnModel && settings.language === "en" && (

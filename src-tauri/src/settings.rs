@@ -71,6 +71,29 @@ pub fn zipformer_model() -> ZipformerModelInfo {
     }
 }
 
+/// Granite 4.0 1B Speech model info
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GraniteModelInfo {
+    pub id: String,
+    pub label: String,
+    pub model_id: String,   // HuggingFace model identifier
+    pub size_mb: u32,
+    pub languages: Vec<String>,
+}
+
+pub fn granite_model() -> GraniteModelInfo {
+    GraniteModelInfo {
+        id: "granite-speech".to_string(),
+        label: "Granite 4.0 1B Speech".to_string(),
+        model_id: "ibm-granite/granite-4.0-1b-speech".to_string(),
+        size_mb: 2000,
+        languages: vec![
+            "en".to_string(), "fr".to_string(), "de".to_string(),
+            "es".to_string(), "pt".to_string(), "ja".to_string(),
+        ],
+    }
+}
+
 /// Saved pill position on a specific monitor (logical coordinates relative to monitor origin)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PillPosition {
@@ -97,12 +120,15 @@ pub struct AppSettings {
     #[serde(default)]
     pub pill_positions: std::collections::HashMap<String, PillPosition>, // monitor fingerprint -> position
     #[serde(default = "default_local_engine")]
-    pub local_engine: String,       // "whisper" or "zipformer"
+    pub local_engine: String,       // "whisper", "zipformer", or "granite"
+    #[serde(default = "default_granite_port")]
+    pub granite_api_port: u16,      // port for the local Granite inference server
 }
 
 fn default_transcription_mode() -> String { "local".to_string() }
 fn default_cloud_provider() -> String { "openai".to_string() }
 fn default_local_engine() -> String { "whisper".to_string() }
+fn default_granite_port() -> u16 { 8976 }
 
 impl Default for AppSettings {
     fn default() -> Self {
@@ -119,6 +145,7 @@ impl Default for AppSettings {
             cloud_api_key: String::new(),
             pill_positions: std::collections::HashMap::new(),
             local_engine: "whisper".to_string(),
+            granite_api_port: 8976,
         }
     }
 }
@@ -239,4 +266,18 @@ pub fn is_zipformer_ready() -> bool {
         && zf_dir.join("joiner.int8.onnx").exists()
         && zf_dir.join("tokens.txt").exists()
         && sherpa.exists()
+}
+
+/// Get Granite model info
+#[tauri::command]
+pub fn get_granite_model() -> GraniteModelInfo {
+    granite_model()
+}
+
+/// Check if the Granite model is downloaded (model directory with config.json exists)
+#[tauri::command]
+pub fn is_granite_ready() -> bool {
+    let model_dir = data_dir().join("models").join("granite-speech");
+    model_dir.join("config.json").exists()
+        && model_dir.join("model.safetensors").exists()
 }

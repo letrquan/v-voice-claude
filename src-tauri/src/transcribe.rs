@@ -765,3 +765,261 @@ pub async fn transcribe_zipformer(
 
     Ok(text.trim().to_string())
 }
+
+// ─── Granite 4.0 1B Speech support ───
+
+/// Directory containing the downloaded Granite model
+fn granite_model_dir() -> PathBuf {
+    data_dir().join("models").join("granite-speech")
+}
+
+/// Path to the Granite inference server Python script
+fn granite_server_script() -> PathBuf {
+    // The script is bundled alongside the app binary
+    // In development, it lives in the project scripts/ directory
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    // Check next to the binary first (production), then dev path
+    let prod_path = exe_dir.join("scripts").join("granite_server.py");
+    if prod_path.exists() {
+        return prod_path;
+    }
+
+    // Dev: the script is in the project root's scripts/ dir
+    let dev_path = exe_dir
+        .ancestors()
+        .take(5)
+        .find(|p| p.join("scripts").join("granite_server.py").exists())
+        .map(|p| p.join("scripts").join("granite_server.py"))
+        .unwrap_or_else(|| {
+            data_dir().join("scripts").join("granite_server.py")
+        });
+    dev_path
+}
+
+/// Check if the Granite model and Python dependencies are available
+pub fn is_granite_ready() -> bool {
+    let dir = granite_model_dir();
+    dir.join("config.json").exists()
+        && (dir.join("model.safetensors").exists()
+            || dir.join("model.safetensors.index.json").exists())
+}
+
+/// Download the Granite Speech model from HuggingFace.
+/// Uses `huggingface-cli download` or direct download of key files.
+pub async fn download_granite(app: tauri::AppHandle) -> Result<(), String> {
+    if is_granite_ready() {
+        let _ = app.emit("download-progress", 100.0_f64);
+        return Ok(());
+    }
+
+    let model_dir = granite_model_dir();
+    tokio::fs::create_dir_all(&model_dir)
+        .await
+        .map_err(|e| format!("Failed to create granite model dir: {}", e))?;
+
+    let _ = app.emit("download-progress", 5.0_f64);
+
+    let model_info = crate::settings::granite_model();
+
+    // Try using huggingface-cli to download the model
+    // This handles large models with multiple shards properly
+    let mut cmd = tokio::process::Command::new("huggingface-cli");
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(0x08000000);
+    }
+    cmd.arg("download")
+        .arg(&model_info.model_id)
+        .arg("--local-dir")
+        .arg(model_dir.to_str().unwrap());
+
+    let _ = app.emit("download-progress", 10.0_f64);
+
+    let output = cmd
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run huggingface-cli. Make sure it's installed (pip install huggingface_hub): {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "huggingface-cli download failed: {}. \
+             Install with: pip install huggingface_hub",
+            stderr
+        ));
+    }
+
+    let _ = app.emit("download-progress", 100.0_f64);
+    Ok(())
+}
+
+/// Check if the Granite server is running and healthy
+pub async fn is_granite_server_running(port: u16) -> bool {
+    let url = format!("http://127.0.0.1:{}/health", port);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    match client.get(&url).send().await {
+        Ok(resp) => {
+            if let Ok(body) = resp.json::<serde_json::Value>().await {
+                body["status"].as_str() == Some("ready")
+            } else {
+                false
+            }
+        }
+        Err(_) => false,
+    }
+}
+
+/// Start the Granite inference server as a background process.
+/// Returns Ok if the server starts successfully (or is already running).
+pub async fn start_granite_server(port: u16) -> Result<(), String> {
+    // Already running?
+    if is_granite_server_running(port).await {
+        return Ok(());
+    }
+
+    let model_dir = granite_model_dir();
+    if !is_granite_ready() {
+        return Err("Granite model not downloaded yet".to_string());
+    }
+
+    let script = granite_server_script();
+    if !script.exists() {
+        // Copy bundled script to data dir
+        let dest_dir = data_dir().join("scripts");
+        let dest = dest_dir.join("granite_server.py");
+        if !dest.exists() {
+            return Err(format!(
+                "Granite server script not found at {:?}. Please ensure granite_server.py is available.",
+                script
+            ));
+        }
+    }
+
+    let mut cmd = tokio::process::Command::new("python");
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    cmd.arg(script.to_str().unwrap())
+        .arg("--model-dir")
+        .arg(model_dir.to_str().unwrap())
+        .arg("--port")
+        .arg(port.to_string());
+
+    cmd.stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    let _child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to start Granite server: {}. Make sure Python is installed.", e))?;
+
+    // Wait for server to become ready (up to 120 seconds for model loading)
+    for i in 0..240 {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if is_granite_server_running(port).await {
+            return Ok(());
+        }
+        // Log progress periodically
+        if i % 10 == 0 && i > 0 {
+            eprintln!("[granite] Waiting for server... ({:.0}s)", i as f64 * 0.5);
+        }
+    }
+
+    Err("Granite server failed to start within 120 seconds".to_string())
+}
+
+/// Stop the Granite inference server
+pub async fn stop_granite_server(port: u16) -> Result<(), String> {
+    let url = format!("http://127.0.0.1:{}/shutdown", port);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    let _ = client.post(&url).send().await;
+    Ok(())
+}
+
+/// Transcribe audio using the local Granite inference server
+pub async fn transcribe_granite(
+    samples: Vec<f32>,
+    sample_rate: u32,
+    port: u16,
+    language: &str,
+) -> Result<String, String> {
+    if !is_granite_ready() {
+        return Err("Granite model not downloaded yet".to_string());
+    }
+
+    // Make sure the server is running
+    if !is_granite_server_running(port).await {
+        // Try to start it
+        start_granite_server(port).await?;
+    }
+
+    // Build WAV bytes
+    let wav_bytes = tokio::task::spawn_blocking({
+        let samples = samples.clone();
+        move || samples_to_wav_bytes(&samples, sample_rate)
+    })
+    .await
+    .map_err(|e| format!("WAV task error: {}", e))??;
+
+    // Send to the local server
+    let url = format!("http://127.0.0.1:{}/transcribe", port);
+
+    let file_part = reqwest::multipart::Part::bytes(wav_bytes)
+        .file_name("audio.wav")
+        .mime_str("audio/wav")
+        .map_err(|e| format!("Multipart error: {}", e))?;
+
+    let mut form = reqwest::multipart::Form::new()
+        .part("file", file_part);
+
+    if language != "auto" {
+        form = form.text("language", language.to_string());
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    let response = client
+        .post(&url)
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| format!("Granite server request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("Granite server error ({}): {}", status, body));
+    }
+
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse Granite response: {}", e))?;
+
+    if let Some(error) = body["error"].as_str() {
+        return Err(format!("Granite inference error: {}", error));
+    }
+
+    let text = body["text"]
+        .as_str()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    Ok(text)
+}
