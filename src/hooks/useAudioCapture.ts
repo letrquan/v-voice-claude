@@ -13,7 +13,9 @@ export function useAudioCapture() {
   const streamRef = useRef<MediaStream | null>(null);
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const sinkNodeRef = useRef<GainNode | null>(null);
   const samplesRef = useRef<Float32Array[]>([]);
+  const sampleCountRef = useRef(0);
 
   /** Start capture. Pass a deviceId to use a specific microphone, or "" for default. */
   const start = useCallback(async (deviceId?: string) => {
@@ -59,14 +61,25 @@ export function useAudioCapture() {
       );
       workletNodeRef.current = workletNode;
 
+      const sinkNode = audioContext.createGain();
+      sinkNode.gain.value = 0;
+      sinkNodeRef.current = sinkNode;
+
       samplesRef.current = [];
+      sampleCountRef.current = 0;
       workletNode.port.onmessage = (event) => {
         if (event.data.type === "audio-data") {
-          samplesRef.current.push(new Float32Array(event.data.samples));
+          const samples = event.data.samples instanceof Float32Array
+            ? event.data.samples
+            : new Float32Array(event.data.samples);
+          samplesRef.current.push(samples);
+          sampleCountRef.current += samples.length;
         }
       };
 
       source.connect(workletNode);
+      workletNode.connect(sinkNode);
+      sinkNode.connect(audioContext.destination);
       workletNode.port.postMessage({ command: "start" });
       setIsCapturing(true);
     } catch (err) {
@@ -79,10 +92,7 @@ export function useAudioCapture() {
     if (!audioContextRef.current || samplesRef.current.length === 0) return null;
 
     const sampleRate = audioContextRef.current.sampleRate;
-    const totalLength = samplesRef.current.reduce(
-      (sum, chunk) => sum + chunk.length,
-      0
-    );
+    const totalLength = sampleCountRef.current;
     if (totalLength === 0) return null;
 
     const allSamples = new Float32Array(totalLength);
@@ -102,21 +112,21 @@ export function useAudioCapture() {
     if (!audioContextRef.current || samplesRef.current.length === 0) return null;
 
     const sampleRate = audioContextRef.current.sampleRate;
-    const totalLength = samplesRef.current.reduce(
-      (sum, chunk) => sum + chunk.length,
-      0
-    );
+    const chunks = samplesRef.current;
+    const totalLength = sampleCountRef.current;
     if (totalLength === 0) return null;
+
+    // Swap the queue before merging so audio arriving after this snapshot is
+    // kept for the next transcription window.
+    samplesRef.current = [];
+    sampleCountRef.current = 0;
 
     const allSamples = new Float32Array(totalLength);
     let offset = 0;
-    for (const chunk of samplesRef.current) {
+    for (const chunk of chunks) {
       allSamples.set(chunk, offset);
       offset += chunk.length;
     }
-
-    // Clear buffer — new audio will accumulate from here
-    samplesRef.current = [];
 
     return { samples: allSamples, sampleRate };
   }, []);
@@ -133,13 +143,11 @@ export function useAudioCapture() {
     const sampleRate = audioContextRef.current.sampleRate;
 
     // Merge all sample chunks into one Float32Array
-    const totalLength = samplesRef.current.reduce(
-      (sum, chunk) => sum + chunk.length,
-      0
-    );
+    const chunks = samplesRef.current;
+    const totalLength = sampleCountRef.current;
     const allSamples = new Float32Array(totalLength);
     let offset = 0;
-    for (const chunk of samplesRef.current) {
+    for (const chunk of chunks) {
       allSamples.set(chunk, offset);
       offset += chunk.length;
     }
@@ -149,6 +157,13 @@ export function useAudioCapture() {
       sourceRef.current.disconnect();
       sourceRef.current = null;
     }
+    if (workletNodeRef.current) {
+      workletNodeRef.current.disconnect();
+    }
+    if (sinkNodeRef.current) {
+      sinkNodeRef.current.disconnect();
+      sinkNodeRef.current = null;
+    }
     streamRef.current?.getTracks().forEach((track) => track.stop());
     await audioContextRef.current.close();
 
@@ -157,6 +172,7 @@ export function useAudioCapture() {
     audioContextRef.current = null;
     workletNodeRef.current = null;
     samplesRef.current = [];
+    sampleCountRef.current = 0;
 
     return { samples: allSamples, sampleRate };
   }, []);

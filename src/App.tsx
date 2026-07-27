@@ -45,14 +45,50 @@ const VAD_DEFAULTS = {
 /* ─── Sizes ─── */
 const SIZE_IDLE = { w: 48, h: 48 };
 const SIZE_PILL = { w: 260, h: 48 };
-const SIZE_TALL = { w: 260, h: 100 };
+const SIZE_TALL = { w: 260, h: 120 };
 
 /* ─── Timing ─── */
 const TRANSITION_MS = 420;
 const SHOW_TRANSCRIPT_DELAY = 300;
-const STREAMING_CHUNK_MS = 3500; // consume + transcribe every 3.5s
-const MIN_CHUNK_DURATION = 0.75; // minimum seconds of audio per chunk
+const STREAMING_CHUNK_MS = 2000; // collect audio every 2s
+const STREAMING_WINDOW_DURATION = 4; // enough context without delaying first text
+const STREAMING_OVERLAP_DURATION = 0.65; // preserve boundary phonemes
+const STREAMING_PREROLL_DURATION = 0.5; // retain speech onset without decoding silence
 const MIN_FINAL_CHUNK_DURATION = 0.25; // minimum seconds for the final chunk
+
+function appendAudio(existing: Float32Array | null, incoming: Float32Array): Float32Array {
+  if (!existing || existing.length === 0) return incoming;
+  const merged = new Float32Array(existing.length + incoming.length);
+  merged.set(existing);
+  merged.set(incoming, existing.length);
+  return merged;
+}
+
+/** Return only the newly recognized words from an overlapping window. */
+function mergeTranscript(existing: string, incoming: string): string {
+  const next = incoming.trim();
+  if (!next) return "";
+  if (!existing.trim()) return next;
+
+  const oldWords = existing.trim().split(/\s+/);
+  const newWords = next.split(/\s+/);
+  const normalize = (word: string) => word.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
+  const oldNormalized = oldWords.map(normalize);
+  const newNormalized = newWords.map(normalize);
+  const maxOverlap = Math.min(24, oldWords.length, newWords.length);
+  let overlap = 0;
+
+  for (let size = maxOverlap; size > 0; size -= 1) {
+    const oldTail = oldNormalized.slice(-size);
+    const newHead = newNormalized.slice(0, size);
+    if (oldTail.every((word, index) => word && word === newHead[index])) {
+      overlap = size;
+      break;
+    }
+  }
+
+  return newWords.slice(overlap).join(" ").trim();
+}
 
 /**
  * Resize the window while keeping its visual center-x and bottom-y anchored.
@@ -95,21 +131,36 @@ function App() {
   const vadArcRef = useRef<SVGCircleElement>(null);
 
   // VAD state refs
-  const silentFramesRef = useRef(0);
+  const silenceStartMsRef = useRef<number>(0);
   const speechFramesRef = useRef(0);
   const isSpeakingRef = useRef(false);
+  const speechDetectedRef = useRef(false);
   const vadWarmupUntilRef = useRef(0); // timestamp: ignore VAD auto-stop until this time
+  const noiseFloorRef = useRef(0.005);
 
   const { start, stop, consumeBuffer, analyserNode } = useAudioCapture();
 
   // Streaming transcription refs
   const streamingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const streamingBusyRef = useRef(false);
+  const streamingTaskRef = useRef<Promise<void> | null>(null);
   const committedTextRef = useRef("");
+  const streamingPendingRef = useRef<Float32Array | null>(null);
+  const streamingSampleRateRef = useRef(16000);
+  const discardStreamingRef = useRef(false);
+
+  const transcriptScrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     stateRef.current = state;
   }, [state]);
+
+  // Auto-scroll transcript
+  useEffect(() => {
+    if (transcriptScrollRef.current) {
+      transcriptScrollRef.current.scrollTop = transcriptScrollRef.current.scrollHeight;
+    }
+  }, [transcript]);
 
   useEffect(() => {
     modelReadyRef.current = modelReady;
@@ -132,31 +183,52 @@ function App() {
       pill.style.setProperty("--glow-opacity", String(glowOpacity));
     }
 
-    // Skip VAD during warm-up period (mic initialization produces noise)
+    // Learn the local noise floor during mic startup instead of using a fixed
+    // threshold that behaves poorly across microphones and rooms.
     const now = Date.now();
-    if (now < vadWarmupUntilRef.current) return;
+    if (now < vadWarmupUntilRef.current) {
+      noiseFloorRef.current = noiseFloorRef.current * 0.92 + rms * 0.08;
+      return;
+    }
 
-    const speech = rms > s.vad_silence_threshold;
+    const adaptiveThreshold = Math.max(
+      s.vad_silence_threshold * 0.6,
+      noiseFloorRef.current * 2.2
+    );
+    const speechThreshold = isSpeakingRef.current
+      ? adaptiveThreshold * 0.72
+      : adaptiveThreshold;
+    const speech = rms > speechThreshold;
+
+    if (!isSpeakingRef.current && rms < adaptiveThreshold) {
+      noiseFloorRef.current = noiseFloorRef.current * 0.98 + rms * 0.02;
+    }
+    const targetSilenceMs = s.vad_silence_frames * (1000 / 60);
 
     if (speech) {
       speechFramesRef.current++;
-      silentFramesRef.current = 0;
+      silenceStartMsRef.current = 0;
       if (!isSpeakingRef.current && speechFramesRef.current >= VAD_DEFAULTS.MIN_SPEECH_FRAMES) {
         isSpeakingRef.current = true;
+        speechDetectedRef.current = true;
         setIsSpeaking(true);
       }
     } else {
-      silentFramesRef.current++;
-      if (isSpeakingRef.current) speechFramesRef.current = 0;
+      speechFramesRef.current = 0;
+      if (silenceStartMsRef.current === 0) {
+        silenceStartMsRef.current = now;
+      }
 
-      const prog = Math.min(silentFramesRef.current / s.vad_silence_frames, 1);
+      const elapsedMs = now - silenceStartMsRef.current;
+      const prog = Math.min(elapsedMs / targetSilenceMs, 1);
+
       if (vadArcRef.current) {
         vadArcRef.current.style.strokeDashoffset = (VAD_DEFAULTS.RING_CIRC * (1 - prog)).toFixed(2);
       }
 
-      if (isSpeakingRef.current && silentFramesRef.current >= s.vad_silence_frames) {
+      if (isSpeakingRef.current && elapsedMs >= targetSilenceMs) {
         isSpeakingRef.current = false;
-        silentFramesRef.current = 0;
+        silenceStartMsRef.current = 0;
         setIsSpeaking(false);
         if (vadArcRef.current) {
           vadArcRef.current.style.strokeDashoffset = String(VAD_DEFAULTS.RING_CIRC);
@@ -171,6 +243,7 @@ function App() {
   // ─── Close button (cancel listening) ───
   const handleClose = useCallback(async () => {
     if (stateRef.current === "listening") {
+      discardStreamingRef.current = true;
       // Stop streaming
       if (streamingIntervalRef.current) {
         clearInterval(streamingIntervalRef.current);
@@ -178,15 +251,21 @@ function App() {
       }
       streamingBusyRef.current = false;
       committedTextRef.current = "";
+      streamingPendingRef.current = null;
+      speechDetectedRef.current = false;
 
+      if (streamingTaskRef.current) {
+        await streamingTaskRef.current;
+      }
       await stop();
       setState("idle");
       stateRef.current = "idle";
       setShowTranscript(false);
       setIsSpeaking(false);
-      silentFramesRef.current = 0;
+      silenceStartMsRef.current = 0;
       speechFramesRef.current = 0;
       isSpeakingRef.current = false;
+      speechDetectedRef.current = false;
       await new Promise((r) => setTimeout(r, TRANSITION_MS));
       await resizeInPlace(SIZE_IDLE.w, SIZE_IDLE.h);
       setTranscript("");
@@ -196,6 +275,14 @@ function App() {
   // ─── Quit app ───
   const handleQuit = useCallback(async () => {
     if (stateRef.current === "listening") {
+      discardStreamingRef.current = true;
+      if (streamingIntervalRef.current) {
+        clearInterval(streamingIntervalRef.current);
+        streamingIntervalRef.current = null;
+      }
+      if (streamingTaskRef.current) {
+        await streamingTaskRef.current;
+      }
       await stop();
     }
     await getCurrentWindow().close();
@@ -206,7 +293,7 @@ function App() {
     const currentState = stateRef.current;
 
     if (currentState === "idle" && modelReadyRef.current) {
-      silentFramesRef.current = 0;
+      silenceStartMsRef.current = 0;
       speechFramesRef.current = 0;
       isSpeakingRef.current = false;
       setIsSpeaking(false);
@@ -215,6 +302,11 @@ function App() {
       setErrorMsg("");
       streamingBusyRef.current = false;
       vadWarmupUntilRef.current = Date.now() + 1200; // 1.2s grace period for mic warm-up
+      noiseFloorRef.current = Math.max(0.003, settingsRef.current.vad_silence_threshold / 3);
+      streamingPendingRef.current = null;
+      streamingSampleRateRef.current = 16000;
+      discardStreamingRef.current = false;
+      speechDetectedRef.current = false;
 
       await resizeInPlace(SIZE_PILL.w, SIZE_PILL.h);
       setState("listening");
@@ -230,38 +322,68 @@ function App() {
         }
       }, SHOW_TRANSCRIPT_DELAY);
 
-      // ─── Start chunked streaming (transcribe + type directly) ───
+      // ─── Start overlapping streaming (transcribe + type stable words) ───
       committedTextRef.current = "";
-      streamingIntervalRef.current = setInterval(async () => {
+      streamingIntervalRef.current = setInterval(() => {
         if (stateRef.current !== "listening") return;
         if (streamingBusyRef.current) return;
 
         const buf = consumeBuffer();
-        if (!buf || buf.samples.length < buf.sampleRate * MIN_CHUNK_DURATION) return;
-
-        streamingBusyRef.current = true;
-        try {
-          const chunkText = await invoke<string>("transcribe_streaming", {
-            samples: Array.from(buf.samples),
-            sampleRate: buf.sampleRate,
-            prompt: committedTextRef.current,
-          });
-          if (chunkText && chunkText.trim() && stateRef.current === "listening") {
-            const trimmed = chunkText.trim();
-            const textToType = committedTextRef.current ? " " + trimmed : trimmed;
-
-            // Type directly into active textbox
-            await invoke("type_text", { text: textToType });
-
-            // Track committed text
-            committedTextRef.current += textToType;
-            setTranscript(committedTextRef.current);
-          }
-        } catch {
-          // Non-critical, skip this chunk
-        } finally {
-          streamingBusyRef.current = false;
+        if (buf) {
+          streamingSampleRateRef.current = buf.sampleRate;
+          streamingPendingRef.current = appendAudio(streamingPendingRef.current, buf.samples);
         }
+
+        const pending = streamingPendingRef.current;
+        if (!pending) return;
+        const sampleRate = streamingSampleRateRef.current;
+        if (!speechDetectedRef.current) {
+          const prerollSamples = Math.floor(sampleRate * STREAMING_PREROLL_DURATION);
+          if (pending.length > prerollSamples) {
+            streamingPendingRef.current = pending.slice(-prerollSamples);
+          }
+          return;
+        }
+        const windowSamples = Math.floor(sampleRate * STREAMING_WINDOW_DURATION);
+        const overlapSamples = Math.floor(sampleRate * STREAMING_OVERLAP_DURATION);
+        if (pending.length < windowSamples) return;
+
+        const window = pending.slice(0, windowSamples);
+
+        const task = (async () => {
+          streamingBusyRef.current = true;
+          try {
+            const chunkText = await invoke<string>("transcribe_streaming", {
+              samples: Array.from(window),
+              sampleRate,
+              prompt: committedTextRef.current.slice(-250),
+            });
+            const delta = mergeTranscript(committedTextRef.current, chunkText);
+            if (delta && !discardStreamingRef.current) {
+              const textToType = committedTextRef.current ? " " + delta : delta;
+
+              // Type directly into active textbox
+              await invoke("type_text", { text: textToType });
+
+              // Track committed text
+              committedTextRef.current += textToType;
+              setTranscript(committedTextRef.current);
+            }
+            // Keep a short tail so the next window can recover words split at
+            // the boundary without retranscribing the entire session.
+            streamingPendingRef.current = pending.slice(
+              Math.max(0, windowSamples - overlapSamples)
+            );
+          } catch {
+            // Keep the window queued so a transient failure does not lose audio.
+          } finally {
+            streamingBusyRef.current = false;
+          }
+        })();
+        streamingTaskRef.current = task;
+        void task.finally(() => {
+          if (streamingTaskRef.current === task) streamingTaskRef.current = null;
+        });
       }, STREAMING_CHUNK_MS);
 
     } else if (currentState === "listening") {
@@ -274,32 +396,38 @@ function App() {
       setState("processing");
       stateRef.current = "processing";
 
-      // Wait for any in-progress streaming transcription to complete
-      let waitCount = 0;
-      while (streamingBusyRef.current && waitCount < 50) {
-        await new Promise((r) => setTimeout(r, 100));
-        waitCount++;
+      // Wait for any in-progress streaming transcription to complete before
+      // flushing the remaining audio, avoiding overlapping native inference.
+      if (streamingTaskRef.current) {
+        await streamingTaskRef.current;
       }
-      streamingBusyRef.current = false;
 
       // Stop audio capture — returns remaining audio since last consume
       const remainingAudio = await stop();
+      if (remainingAudio) {
+        streamingPendingRef.current = appendAudio(streamingPendingRef.current, remainingAudio.samples);
+      }
 
       // Transcribe and type remaining audio
-      if (remainingAudio && remainingAudio.samples.length > remainingAudio.sampleRate * MIN_FINAL_CHUNK_DURATION) {
+      const pendingFinal = streamingPendingRef.current;
+      const finalSampleRate = remainingAudio?.sampleRate ?? streamingSampleRateRef.current;
+      if (speechDetectedRef.current
+        && pendingFinal
+        && pendingFinal.length > finalSampleRate * MIN_FINAL_CHUNK_DURATION) {
         try {
           const chunkText = await invoke<string>("transcribe_streaming", {
-            samples: Array.from(remainingAudio.samples),
-            sampleRate: remainingAudio.sampleRate,
-            prompt: committedTextRef.current,
+            samples: Array.from(pendingFinal),
+            sampleRate: finalSampleRate,
+            prompt: committedTextRef.current.slice(-250),
           });
-          if (chunkText && chunkText.trim()) {
-            const trimmed = chunkText.trim();
-            const textToType = committedTextRef.current ? " " + trimmed : trimmed;
+          const delta = mergeTranscript(committedTextRef.current, chunkText);
+          if (delta) {
+            const textToType = committedTextRef.current ? " " + delta : delta;
             await invoke("type_text", { text: textToType });
             committedTextRef.current += textToType;
             setTranscript(committedTextRef.current);
           }
+          streamingPendingRef.current = null;
         } catch (e) {
           console.error("Final chunk transcription error:", e);
           setErrorMsg(String(e));
@@ -319,6 +447,8 @@ function App() {
       setTimeout(() => {
         setTranscript("");
         committedTextRef.current = "";
+        streamingPendingRef.current = null;
+        discardStreamingRef.current = false;
       }, 2000);
     }
   }, [start, stop, consumeBuffer]);
@@ -460,6 +590,14 @@ function App() {
         const oldSettings = settingsRef.current;
         setSettings(s);
         settingsRef.current = s;
+
+        const oldUsesWhisper = oldSettings.transcription_mode === "local"
+          && oldSettings.local_engine === "whisper";
+        const newUsesWhisper = s.transcription_mode === "local"
+          && s.local_engine === "whisper";
+        if (oldUsesWhisper && (!newUsesWhisper || s.model !== oldSettings.model)) {
+          await invoke("stop_whisper_server");
+        }
 
         // Re-register hotkeys if they changed
         if (s.hotkey !== oldSettings.hotkey || s.quit_hotkey !== oldSettings.quit_hotkey) {
@@ -616,16 +754,16 @@ function App() {
       </div>
 
       {/* ─── Transcript row ─── */}
-      <div className="transcript-row" data-tauri-drag-region>
+      <div className="transcript-row" ref={transcriptScrollRef} data-tauri-drag-region>
         <div className="tx" data-tauri-drag-region>
           {errorMsg && state !== "idle" ? (
             <span className="tx-error">{errorMsg}</span>
           ) : state === "processing" ? (
             <span className="tx-pending">finalizing...</span>
           ) : transcript && state === "listening" ? (
-            <span className="tx-streaming">{transcript.slice(-80)}<span className="tx-cursor">|</span></span>
+            <span className="tx-streaming">{transcript}<span className="tx-cursor">|</span></span>
           ) : transcript ? (
-            transcript.slice(-80)
+            transcript
           ) : (
             <span className="tx-interim">listening...</span>
           )}

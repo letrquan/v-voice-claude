@@ -6,7 +6,7 @@ use settings::SettingsState;
 use std::sync::Mutex;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
 
 #[tauri::command]
 async fn is_model_ready(state: tauri::State<'_, SettingsState>) -> Result<bool, String> {
@@ -96,6 +96,11 @@ async fn transcribe_streaming(
         transcribe::transcribe_partial(samples, sample_rate, &settings.model, &settings.language, &prompt)
             .await
     }
+}
+
+#[tauri::command]
+fn stop_whisper_server() {
+    transcribe::stop_whisper_server();
 }
 
 #[tauri::command]
@@ -297,7 +302,7 @@ pub fn run() {
         std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", &args);
     }
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_store::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
@@ -306,6 +311,7 @@ pub fn run() {
             download_specific_model,
             transcribe,
             transcribe_streaming,
+            stop_whisper_server,
             type_text,
             download_zipformer_model,
             is_zipformer_model_ready,
@@ -424,6 +430,12 @@ pub fn run() {
 
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|_, event| {
+        if matches!(event, RunEvent::ExitRequested { .. } | RunEvent::Exit) {
+            transcribe::stop_whisper_server();
+        }
+    });
 }

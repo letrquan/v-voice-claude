@@ -1,5 +1,8 @@
 use std::io::{Cursor, Read};
 use std::path::PathBuf;
+use std::process::{Child, Stdio};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use tauri::Emitter;
@@ -14,6 +17,259 @@ const SHERPA_ONNX_PACKAGE_URL: &str =
 const SHERPA_ONNX_PACKAGE_DIR: &str = "sherpa-onnx-v1.12.29-win-x64-shared-MD-Release-no-tts";
 
 const WHISPER_SAMPLE_RATE: u32 = 16000;
+const WHISPER_SERVER_RETRY_DELAY: Duration = Duration::from_secs(60);
+
+#[derive(Default)]
+struct WhisperServerState {
+    model_id: Option<String>,
+    child: Option<Child>,
+    port: Option<u16>,
+    retry_after: Option<Instant>,
+    generation: u64,
+}
+
+fn whisper_server_state() -> &'static Mutex<WhisperServerState> {
+    static STATE: OnceLock<Mutex<WhisperServerState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(WhisperServerState::default()))
+}
+
+fn whisper_server_start_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+fn whisper_http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(120))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
+}
+
+fn whisper_health_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
+}
+
+fn whisper_thread_count() -> String {
+    std::thread::available_parallelism()
+        .map(|count| count.get().saturating_sub(1).clamp(2, 8))
+        .unwrap_or(4)
+        .to_string()
+}
+
+fn configure_whisper_command(cmd: &mut tokio::process::Command) {
+    cmd.arg("--threads")
+        .arg(whisper_thread_count())
+        .arg("--split-on-word")
+        .arg("--suppress-nst");
+}
+
+fn stop_whisper_server_locked(state: &mut WhisperServerState) {
+    if let Some(mut child) = state.child.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    state.model_id = None;
+    state.port = None;
+}
+
+pub fn stop_whisper_server() {
+    let mut state = whisper_server_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    stop_whisper_server_locked(&mut state);
+    state.retry_after = None;
+    state.generation = state.generation.wrapping_add(1);
+}
+
+async fn whisper_server_healthy(port: u16) -> bool {
+    whisper_health_client()
+        .get(format!("http://127.0.0.1:{}/", port))
+        .send()
+        .await
+        .is_ok()
+}
+
+async fn ensure_whisper_server(model_id: &str) -> Result<u16, String> {
+    let _start_guard = whisper_server_start_lock().lock().await;
+
+    let (existing_port, start_generation) = {
+        let mut state = whisper_server_state()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if let Some(retry_after) = state.retry_after {
+            if retry_after > Instant::now() {
+                return Err("Whisper server is temporarily unavailable".to_string());
+            }
+            state.retry_after = None;
+        }
+
+        let child_running = match state.child.as_mut() {
+            Some(child) => matches!(child.try_wait(), Ok(None)),
+            None => false,
+        };
+
+        if !child_running {
+            stop_whisper_server_locked(&mut state);
+        }
+
+        let existing_port = if state.model_id.as_deref() == Some(model_id) && child_running {
+            state.port
+        } else {
+            if child_running {
+                stop_whisper_server_locked(&mut state);
+            }
+            None
+        };
+        (existing_port, state.generation)
+    };
+
+    if let Some(port) = existing_port {
+        if whisper_server_healthy(port).await {
+            return Ok(port);
+        }
+        let mut state = whisper_server_state()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        stop_whisper_server_locked(&mut state);
+    }
+
+    let server = server_path();
+    let model = model_path(model_id);
+    if !server.exists() || !model.exists() {
+        return Err("Whisper server or model is not ready".to_string());
+    }
+
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .map_err(|e| format!("Failed to reserve Whisper server port: {}", e))?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| format!("Failed to read Whisper server port: {}", e))?
+        .port();
+    drop(listener);
+
+    let mut command = std::process::Command::new(&server);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    command
+        .arg("-m")
+        .arg(&model)
+        .arg("--host")
+        .arg("127.0.0.1")
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--threads")
+        .arg(whisper_thread_count())
+        .arg("--no-timestamps")
+        .arg("--split-on-word")
+        .arg("--suppress-nst")
+        .arg("--no-language-probabilities")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    if let Some(bin_dir) = server.parent() {
+        command.current_dir(bin_dir);
+    }
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let mut state = whisper_server_state()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.generation == start_generation {
+                state.retry_after = Some(Instant::now() + WHISPER_SERVER_RETRY_DELAY);
+            }
+            return Err(format!("Failed to start whisper-server: {}", error));
+        }
+    };
+
+    {
+        let mut state = whisper_server_state()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.generation != start_generation {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("Whisper server startup was cancelled".to_string());
+        }
+        state.model_id = Some(model_id.to_string());
+        state.child = Some(child);
+        state.port = Some(port);
+    }
+
+    for _ in 0..300 {
+        if whisper_server_healthy(port).await {
+            return Ok(port);
+        }
+
+        let process_failure = {
+            let mut state = whisper_server_state()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.generation != start_generation {
+                Some(("Whisper server startup was cancelled".to_string(), false))
+            } else {
+                match state.child.as_mut() {
+                    Some(child) => match child.try_wait() {
+                        Ok(Some(status)) => Some((
+                            format!("Whisper server exited during startup: {}", status),
+                            true,
+                        )),
+                        Ok(None) => None,
+                        Err(error) => Some((
+                            format!("Failed to inspect whisper-server: {}", error),
+                            true,
+                        )),
+                    },
+                    None => Some(("Whisper server stopped during startup".to_string(), false)),
+                }
+            }
+        };
+
+        if let Some((error, should_retry_later)) = process_failure {
+            if should_retry_later {
+                let mut state = whisper_server_state()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if state.generation == start_generation {
+                    stop_whisper_server_locked(&mut state);
+                    state.retry_after = Some(Instant::now() + WHISPER_SERVER_RETRY_DELAY);
+                }
+            }
+            return Err(error);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let mut state = whisper_server_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    stop_whisper_server_locked(&mut state);
+    state.retry_after = Some(Instant::now() + WHISPER_SERVER_RETRY_DELAY);
+    Err("Whisper server failed to become ready".to_string())
+}
+
+fn valid_zipformer_tokens(path: &std::path::Path) -> bool {
+    std::fs::read_to_string(path)
+        .map(|contents| {
+            let trimmed = contents.trim_start();
+            !trimmed.starts_with('{') && contents.lines().count() > 10
+        })
+        .unwrap_or(false)
+}
 
 /// Returns the base directory for all v-voice-claude data
 fn data_dir() -> PathBuf {
@@ -32,9 +288,13 @@ fn cli_path() -> PathBuf {
     data_dir().join("bin").join("whisper-cli.exe")
 }
 
-/// Check if both the given model and CLI binary are available
+fn server_path() -> PathBuf {
+    data_dir().join("bin").join("whisper-server.exe")
+}
+
+/// Check if the model and both Whisper execution paths are available.
 pub fn is_ready(model_id: &str) -> bool {
-    model_path(model_id).exists() && cli_path().exists()
+    model_path(model_id).exists() && cli_path().exists() && server_path().exists()
 }
 
 /// Download a URL into memory, emitting progress events.
@@ -66,11 +326,12 @@ async fn download_bytes(
     Ok(bytes)
 }
 
-/// Download the specified GGML model and whisper-cli.exe binary (if not already present).
+/// Download the specified GGML model and Whisper binaries (if not already present).
 /// Emits "download-progress" events to the frontend.
 pub async fn download_model(app: tauri::AppHandle, model_id: &str) -> Result<(), String> {
     let model = model_path(model_id);
     let cli = cli_path();
+    let server = server_path();
 
     // Look up model URL from the available models list
     let model_info = settings::available_models()
@@ -78,8 +339,8 @@ pub async fn download_model(app: tauri::AppHandle, model_id: &str) -> Result<(),
         .find(|m| m.id == model_id)
         .ok_or_else(|| format!("Unknown model: {}", model_id))?;
 
-    // If both exist, nothing to do
-    if model.exists() && cli.exists() {
+    // If all runtime files exist, nothing to do.
+    if model.exists() && cli.exists() && server.exists() {
         let _ = app.emit("download-progress", 100.0_f64);
         return Ok(());
     }
@@ -100,8 +361,8 @@ pub async fn download_model(app: tauri::AppHandle, model_id: &str) -> Result<(),
             .map_err(|e| format!("Failed to save model: {}", e))?;
     }
 
-    // --- Download whisper-cli.exe (~4MB zip) ---
-    if !cli.exists() {
+    // --- Download whisper-cli.exe and whisper-server.exe (~4MB zip) ---
+    if !cli.exists() || !server.exists() {
         let _ = app.emit("download-progress", 92.0_f64);
 
         let bin_dir = data_dir().join("bin");
@@ -116,7 +377,8 @@ pub async fn download_model(app: tauri::AppHandle, model_id: &str) -> Result<(),
         let mut archive =
             zip::ZipArchive::new(cursor).map_err(|e| format!("Failed to open zip: {}", e))?;
 
-        let mut found_cli = false;
+        let mut found_cli = cli.exists();
+        let mut found_server = server.exists();
         for i in 0..archive.len() {
             let mut file = archive
                 .by_index(i)
@@ -125,8 +387,9 @@ pub async fn download_model(app: tauri::AppHandle, model_id: &str) -> Result<(),
             let name = file.name().to_string();
             let file_name = name.rsplit('/').next().unwrap_or(&name);
 
-            let should_extract =
-                file_name == "whisper-cli.exe" || file_name.ends_with(".dll");
+            let should_extract = file_name == "whisper-cli.exe"
+                || file_name == "whisper-server.exe"
+                || file_name.ends_with(".dll");
 
             if should_extract && !file.is_dir() {
                 let dest = bin_dir.join(file_name);
@@ -138,6 +401,8 @@ pub async fn download_model(app: tauri::AppHandle, model_id: &str) -> Result<(),
 
                 if file_name == "whisper-cli.exe" {
                     found_cli = true;
+                } else if file_name == "whisper-server.exe" {
+                    found_server = true;
                 }
             }
         }
@@ -145,6 +410,11 @@ pub async fn download_model(app: tauri::AppHandle, model_id: &str) -> Result<(),
         if !found_cli {
             return Err(
                 "whisper-cli.exe not found in the downloaded zip archive".to_string(),
+            );
+        }
+        if !found_server {
+            return Err(
+                "whisper-server.exe not found in the downloaded zip archive".to_string(),
             );
         }
     }
@@ -242,6 +512,7 @@ pub async fn transcribe_audio(
     cmd.arg("-m").arg(model_str);
     cmd.arg("-f").arg(wav_str);
     cmd.arg("--no-timestamps");
+    configure_whisper_command(&mut cmd);
 
     // Language: "auto" means let whisper detect; otherwise specify
     if language != "auto" {
@@ -276,8 +547,94 @@ pub async fn transcribe_audio(
 }
 
 /// Transcribe audio partially (for real-time streaming preview).
-/// Uses a separate temp file so it doesn't conflict with the final transcription.
+/// Prefer the persistent server and fall back to the CLI if it cannot start.
 pub async fn transcribe_partial(
+    samples: Vec<f32>,
+    sample_rate: u32,
+    model_id: &str,
+    language: &str,
+    prompt: &str,
+) -> Result<String, String> {
+    match transcribe_partial_server(
+        samples.clone(),
+        sample_rate,
+        model_id,
+        language,
+        prompt,
+    )
+    .await
+    {
+        Ok(text) => Ok(text),
+        Err(error) => {
+            eprintln!("[whisper-server] {}; falling back to whisper-cli", error);
+            transcribe_partial_cli(samples, sample_rate, model_id, language, prompt).await
+        }
+    }
+}
+
+async fn transcribe_partial_server(
+    samples: Vec<f32>,
+    sample_rate: u32,
+    model_id: &str,
+    language: &str,
+    prompt: &str,
+) -> Result<String, String> {
+    let port = ensure_whisper_server(model_id).await?;
+    let wav_bytes = tokio::task::spawn_blocking(move || samples_to_wav_bytes(&samples, sample_rate))
+        .await
+        .map_err(|e| format!("WAV task error: {}", e))??;
+
+    let file_part = reqwest::multipart::Part::bytes(wav_bytes)
+        .file_name("audio.wav")
+        .mime_str("audio/wav")
+        .map_err(|e| format!("Multipart error: {}", e))?;
+
+    let mut form = reqwest::multipart::Form::new()
+        .part("file", file_part)
+        .text("response_format", "json")
+        .text("temperature", "0");
+
+    if language != "auto" {
+        form = form.text("language", language.to_string());
+    }
+
+    let prompt_text = if language == "vi" {
+        if prompt.is_empty() {
+            "Xin chào, đây là bản ghi âm tiếng Việt. Hãy chuyển đổi chính xác với dấu thanh đầy đủ.".to_string()
+        } else {
+            format!("Xin chào, tiếng Việt. {}", prompt)
+        }
+    } else {
+        prompt.to_string()
+    };
+    if !prompt_text.is_empty() {
+        form = form.text("prompt", prompt_text);
+    }
+
+    let response = whisper_http_client()
+        .post(format!("http://127.0.0.1:{}/inference", port))
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| format!("Whisper server request failed: {}", e))?;
+
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read Whisper server response: {}", e))?;
+    if !status.is_success() {
+        return Err(format!("Whisper server error ({}): {}", status, body));
+    }
+
+    let json: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| format!("Failed to parse Whisper server response: {}", e))?;
+    Ok(json["text"].as_str().unwrap_or("").trim().to_string())
+}
+
+/// CLI fallback for systems where whisper-server cannot be started.
+/// Uses a separate temp file so it doesn't conflict with the final transcription.
+async fn transcribe_partial_cli(
     samples: Vec<f32>,
     sample_rate: u32,
     model_id: &str,
@@ -340,6 +697,7 @@ pub async fn transcribe_partial(
     cmd.arg("-m").arg(model_str);
     cmd.arg("-f").arg(wav_str);
     cmd.arg("--no-timestamps");
+    configure_whisper_command(&mut cmd);
 
     if language != "auto" {
         cmd.arg("-l").arg(language);
@@ -521,7 +879,7 @@ pub fn is_zipformer_ready() -> bool {
         && dir.join("encoder.int8.onnx").exists()
         && dir.join("decoder.int8.onnx").exists()
         && dir.join("joiner.int8.onnx").exists()
-        && dir.join("tokens.txt").exists()
+        && valid_zipformer_tokens(&dir.join("tokens.txt"))
 }
 
 /// Download the Zipformer Vietnamese model and sherpa-onnx CLI.
@@ -557,7 +915,9 @@ pub async fn download_zipformer(app: tauri::AppHandle) -> Result<(), String> {
     let total_files = files.len() + 1; // +1 for sherpa-onnx CLI
     for (i, (url, filename)) in files.iter().enumerate() {
         let dest = model_dir.join(filename);
-        if !dest.exists() {
+        let needs_download = !dest.exists()
+            || (*filename == "tokens.txt" && !valid_zipformer_tokens(&dest));
+        if needs_download {
             let base_progress = (i as f64 / total_files as f64) * 100.0;
             let _ = app.emit("download-progress", base_progress);
 

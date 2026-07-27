@@ -67,6 +67,7 @@ pub fn zipformer_model() -> ZipformerModelInfo {
         encoder_url: format!("{}/encoder-epoch-20-avg-10.int8.onnx", base),
         decoder_url: format!("{}/decoder-epoch-20-avg-10.int8.onnx", base),
         joiner_url: format!("{}/joiner-epoch-20-avg-10.int8.onnx", base),
+        // This repository exposes the sherpa token table as config.json.
         tokens_url: format!("{}/config.json", base),
     }
 }
@@ -260,11 +261,17 @@ pub fn get_zipformer_model() -> ZipformerModelInfo {
 #[tauri::command]
 pub fn is_zipformer_ready() -> bool {
     let zf_dir = data_dir().join("models").join("zipformer-vi");
-    let sherpa = data_dir().join("bin").join("sherpa-onnx-streaming.exe");
+    let sherpa = data_dir().join("bin").join("sherpa-onnx-offline.exe");
+    let tokens_valid = std::fs::read_to_string(zf_dir.join("tokens.txt"))
+        .map(|contents| {
+            let trimmed = contents.trim_start();
+            !trimmed.starts_with('{') && contents.lines().count() > 10
+        })
+        .unwrap_or(false);
     zf_dir.join("encoder.int8.onnx").exists()
         && zf_dir.join("decoder.int8.onnx").exists()
         && zf_dir.join("joiner.int8.onnx").exists()
-        && zf_dir.join("tokens.txt").exists()
+        && tokens_valid
         && sherpa.exists()
 }
 

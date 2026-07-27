@@ -304,39 +304,67 @@ export default function SettingsPage() {
   return (
     <div className="settings-page">
       <div className="settings-container">
-        <h1>V Voice Settings</h1>
+        <header className="settings-header">
+          <div className="settings-brand" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none">
+              <rect x="9" y="3" width="6" height="11" rx="3" />
+              <path d="M6 11a6 6 0 0 0 12 0M12 17v4M9 21h6" />
+            </svg>
+          </div>
+          <div>
+            <p className="settings-eyebrow">V Voice</p>
+            <h1>Settings</h1>
+            <p className="settings-subtitle">
+              Choose how your voice is captured, transcribed, and typed.
+            </p>
+          </div>
+        </header>
 
         {/* ─── Transcription Mode ─── */}
-        <section className="settings-section">
-          <h2>Transcription Engine</h2>
+        <section className="settings-section settings-section-featured">
+          <div className="section-heading">
+            <div>
+              <span className="section-index">01</span>
+              <h2>Transcription engine</h2>
+            </div>
+            <p>Pick the balance of privacy, speed, and accuracy that suits you.</p>
+          </div>
           <div className="mode-toggle">
             <button
+              type="button"
               className={`mode-btn ${settings.transcription_mode === "local" && settings.local_engine === "whisper" ? "active" : ""}`}
               onClick={() => update({ transcription_mode: "local", local_engine: "whisper" })}
+              aria-pressed={settings.transcription_mode === "local" && settings.local_engine === "whisper"}
             >
               <span className="mode-icon">💻</span>
               <span className="mode-label">Local</span>
               <span className="mode-desc">Whisper on your machine</span>
             </button>
             <button
+              type="button"
               className={`mode-btn ${settings.transcription_mode === "cloud" ? "active" : ""}`}
               onClick={() => update({ transcription_mode: "cloud" })}
+              aria-pressed={settings.transcription_mode === "cloud"}
             >
               <span className="mode-icon">☁️</span>
               <span className="mode-label">Cloud</span>
               <span className="mode-desc">OpenAI / Groq API</span>
             </button>
             <button
+              type="button"
               className={`mode-btn ${settings.transcription_mode === "local" && settings.local_engine === "zipformer" ? "active" : ""}`}
               onClick={() => update({ transcription_mode: "local", local_engine: "zipformer", language: "vi" })}
+              aria-pressed={settings.transcription_mode === "local" && settings.local_engine === "zipformer"}
             >
               <span className="mode-icon">🇻🇳</span>
               <span className="mode-label">Zipformer</span>
               <span className="mode-desc">Vietnamese · Ultra-fast</span>
             </button>
             <button
+              type="button"
               className={`mode-btn ${settings.transcription_mode === "local" && settings.local_engine === "granite" ? "active" : ""}`}
               onClick={() => update({ transcription_mode: "local", local_engine: "granite" })}
+              aria-pressed={settings.transcription_mode === "local" && settings.local_engine === "granite"}
             >
               <span className="mode-icon">🪨</span>
               <span className="mode-label">Granite</span>
@@ -348,28 +376,39 @@ export default function SettingsPage() {
         {/* ─── Cloud Config (only shown in cloud mode) ─── */}
         {settings.transcription_mode === "cloud" && (
           <section className="settings-section">
-            <h2>Cloud Provider</h2>
+            <div className="section-heading">
+              <div>
+                <span className="section-index">02</span>
+                <h2>Cloud provider</h2>
+              </div>
+              <p>Your API key is stored locally in the app settings.</p>
+            </div>
             <div className="provider-grid">
               <button
+                type="button"
                 className={`provider-card ${settings.cloud_provider === "openai" ? "active" : ""}`}
                 onClick={() => update({ cloud_provider: "openai" })}
+                aria-pressed={settings.cloud_provider === "openai"}
               >
                 <span className="provider-name">OpenAI</span>
                 <span className="provider-desc">Whisper API · Accurate</span>
               </button>
               <button
+                type="button"
                 className={`provider-card ${settings.cloud_provider === "groq" ? "active" : ""}`}
                 onClick={() => update({ cloud_provider: "groq" })}
+                aria-pressed={settings.cloud_provider === "groq"}
               >
                 <span className="provider-name">Groq</span>
                 <span className="provider-desc">Whisper v3 Turbo · Fast</span>
               </button>
             </div>
 
-            <div style={{ marginTop: 16 }}>
-              <h2>API Key</h2>
+            <div className="api-key-field">
+              <label htmlFor="cloud-api-key">API key</label>
               <div className="api-key-row">
                 <input
+                  id="cloud-api-key"
                   type={showApiKey ? "text" : "password"}
                   className="api-key-input"
                   value={settings.cloud_api_key}
@@ -379,14 +418,15 @@ export default function SettingsPage() {
                   autoComplete="off"
                 />
                 <button
+                  type="button"
                   className="btn btn-sm btn-select"
                   onClick={() => setShowApiKey(!showApiKey)}
-                  style={{ flexShrink: 0 }}
+                  aria-label={showApiKey ? "Hide API key" : "Show API key"}
                 >
                   {showApiKey ? "Hide" : "Show"}
                 </button>
               </div>
-              <p className="hint" style={{ marginTop: 6 }}>
+              <p className="hint api-key-hint">
                 {settings.cloud_provider === "groq"
                   ? "Get your free API key at console.groq.com"
                   : "Get your API key at platform.openai.com"}
@@ -531,32 +571,25 @@ export default function SettingsPage() {
 
             {/* Server status */}
             {graniteReady && (
-              <div style={{ marginTop: 12 }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
-                  <span style={{
-                    display: "inline-block",
-                    width: 10,
-                    height: 10,
-                    borderRadius: "50%",
-                    background: graniteServerRunning ? "#22c55e" : "#ef4444",
-                    boxShadow: graniteServerRunning ? "0 0 6px #22c55e" : "0 0 6px #ef4444",
-                  }} />
-                  <span style={{ fontSize: 13, opacity: 0.8 }}>
+              <div className="server-status">
+                <div className="server-status-row">
+                  <span className={`server-status-dot ${graniteServerRunning ? "running" : "stopped"}`} />
+                  <span className="server-status-label">
                     Server {graniteServerRunning ? "running" : "stopped"}
                   </span>
                   {graniteServerRunning ? (
                     <button
+                      type="button"
                       className="btn btn-sm btn-danger"
                       onClick={handleStopGraniteServer}
-                      style={{ marginLeft: "auto" }}
                     >
                       Stop Server
                     </button>
                   ) : (
                     <button
+                      type="button"
                       className="btn btn-sm btn-download"
                       onClick={handleStartGraniteServer}
-                      style={{ marginLeft: "auto" }}
                     >
                       Start Server
                     </button>
@@ -568,7 +601,7 @@ export default function SettingsPage() {
             <p className="hint">
               🌐 Multilingual ASR · EN, FR, DE, ES, PT, JA · Requires Python + PyTorch
             </p>
-            <p className="hint" style={{ marginTop: 4, fontSize: 11 }}>
+            <p className="hint granite-prerequisite">
               Prerequisites: <code>pip install -r scripts/requirements.txt</code>
             </p>
           </section>
@@ -576,7 +609,9 @@ export default function SettingsPage() {
 
         {/* ─── Language ─── */}
         <section className="settings-section">
-          <h2>Language</h2>
+          <div className="section-heading compact">
+            <div><span className="section-index">03</span><h2>Language</h2></div>
+          </div>
           {settings.local_engine === "zipformer" && settings.transcription_mode === "local" ? (
             <p className="hint">🇻🇳 Zipformer engine only supports Vietnamese. Switch to Whisper or Cloud for other languages.</p>
           ) : settings.local_engine === "granite" && settings.transcription_mode === "local" ? (
@@ -605,7 +640,9 @@ export default function SettingsPage() {
 
         {/* ─── Microphone ─── */}
         <section className="settings-section">
-          <h2>Microphone</h2>
+          <div className="section-heading compact">
+            <div><span className="section-index">04</span><h2>Microphone</h2></div>
+          </div>
           <select
             value={settings.microphone_id}
             onChange={(e) => update({ microphone_id: e.target.value })}
@@ -621,10 +658,14 @@ export default function SettingsPage() {
 
         {/* ─── Hotkeys ─── */}
         <section className="settings-section">
-          <h2>Hotkeys</h2>
+          <div className="section-heading">
+            <div><span className="section-index">05</span><h2>Hotkeys</h2></div>
+            <p>Click a shortcut, then press your new key combination.</p>
+          </div>
           <div className="hotkey-row">
             <label>Hold-to-talk</label>
             <button
+              type="button"
               className={`hotkey-btn ${capturingField === "hotkey" ? "capturing" : ""}`}
               onClick={() => setCapturingField("hotkey")}
             >
@@ -634,6 +675,7 @@ export default function SettingsPage() {
           <div className="hotkey-row">
             <label>Quit</label>
             <button
+              type="button"
               className={`hotkey-btn ${capturingField === "quit_hotkey" ? "capturing" : ""}`}
               onClick={() => setCapturingField("quit_hotkey")}
             >
@@ -644,11 +686,14 @@ export default function SettingsPage() {
 
         {/* ─── Footer ─── */}
         <div className="settings-footer">
-          <button className="btn btn-save" onClick={handleSave} disabled={!dirty}>
-            {saved ? "Saved!" : "Save"}
-          </button>
-          <button className="btn btn-cancel" onClick={() => getCurrentWindow().close()}>
+          <p className={`save-state ${dirty ? "is-dirty" : ""}`}>
+            <span />{dirty ? "Unsaved changes" : "Settings are up to date"}
+          </p>
+          <button type="button" className="btn btn-cancel" onClick={() => getCurrentWindow().close()}>
             Close
+          </button>
+          <button type="button" className="btn btn-save" onClick={handleSave} disabled={!dirty}>
+            {saved ? "Saved!" : "Save"}
           </button>
         </div>
       </div>

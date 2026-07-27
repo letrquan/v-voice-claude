@@ -17,10 +17,11 @@ class AudioProcessor extends AudioWorkletProcessor {
         this.recording = false;
         // Flush remaining buffer
         if (this.buffer.length > 0) {
+          const samples = Float32Array.from(this.buffer);
           this.port.postMessage({
             type: "audio-data",
-            samples: this.buffer.slice(),
-          });
+            samples,
+          }, [samples.buffer]);
           this.buffer = [];
         }
       }
@@ -36,10 +37,11 @@ class AudioProcessor extends AudioWorkletProcessor {
 
       // Send when buffer is full
       if (this.buffer.length >= this.bufferSize) {
+        const samples = Float32Array.from(this.buffer);
         this.port.postMessage({
           type: "audio-data",
-          samples: this.buffer.slice(),
-        });
+          samples,
+        }, [samples.buffer]);
         this.buffer = [];
       }
     }
