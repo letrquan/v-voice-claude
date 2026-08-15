@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { captureHotkey, formatHotkey } from "../lib/hotkey";
 
 /* ─── Types (mirror Rust structs) ─── */
 
@@ -51,48 +52,6 @@ const LANGUAGES = [
   { code: "ar", label: "Arabic" },
 ];
 
-/* ─── Hotkey capture helpers ─── */
-
-const MODIFIER_KEYS = new Set([
-  "Control",
-  "Shift",
-  "Alt",
-  "Meta",
-]);
-
-const KEY_MAP: Record<string, string> = {
-  Control: "CommandOrControl",
-  Meta: "CommandOrControl",
-  " ": "Space",
-  ArrowUp: "Up",
-  ArrowDown: "Down",
-  ArrowLeft: "Left",
-  ArrowRight: "Right",
-};
-
-function keyboardEventToAccelerator(e: KeyboardEvent): string | null {
-  const parts: string[] = [];
-  if (e.ctrlKey || e.metaKey) parts.push("CommandOrControl");
-  if (e.shiftKey) parts.push("Shift");
-  if (e.altKey) parts.push("Alt");
-
-  // Need at least one modifier
-  if (parts.length === 0) return null;
-
-  const key = e.key;
-  if (MODIFIER_KEYS.has(key)) return null; // only modifiers pressed so far
-
-  const mapped = KEY_MAP[key] || key.toUpperCase();
-  parts.push(mapped);
-  return parts.join("+");
-}
-
-function formatHotkey(accel: string): string {
-  return accel
-    .replace("CommandOrControl", "Ctrl")
-    .replace(/\+/g, " + ");
-}
-
 /* ─── Component ─── */
 
 export default function SettingsPage() {
@@ -103,14 +62,12 @@ export default function SettingsPage() {
   const [downloadingModel, setDownloadingModel] = useState<string | null>(null);
   const [downloadProgress, setDownloadProgress] = useState(0);
   const [capturingField, setCapturingField] = useState<"hotkey" | "quit_hotkey" | null>(null);
+  const [hotkeyHint, setHotkeyHint] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [showApiKey, setShowApiKey] = useState(false);
   const [zipformerReady, setZipformerReady] = useState(false);
   const [downloadingZipformer, setDownloadingZipformer] = useState(false);
-  const [graniteReady, setGraniteReady] = useState(false);
-  const [downloadingGranite, setDownloadingGranite] = useState(false);
-  const [graniteServerRunning, setGraniteServerRunning] = useState(false);
 
   // ─── Load initial data ───
   useEffect(() => {
@@ -119,15 +76,11 @@ export default function SettingsPage() {
       invoke<ModelInfo[]>("get_available_models"),
       invoke<string[]>("get_downloaded_models"),
       invoke<boolean>("is_zipformer_model_ready"),
-      invoke<boolean>("is_granite_model_ready"),
-      invoke<boolean>("is_granite_server_running"),
-    ]).then(([s, m, d, zf, gr, gs]) => {
+    ]).then(([s, m, d, zf]) => {
       setSettings(s);
       setModels(m);
       setDownloadedModels(d);
       setZipformerReady(zf);
-      setGraniteReady(gr);
-      setGraniteServerRunning(gs);
     });
 
     // Enumerate microphones
@@ -162,13 +115,20 @@ export default function SettingsPage() {
       // Escape cancels
       if (e.key === "Escape") {
         setCapturingField(null);
+        setHotkeyHint(null);
         return;
       }
 
-      const accel = keyboardEventToAccelerator(e);
-      if (accel) {
-        setSettings({ ...settings, [capturingField]: accel });
+      const captured = captureHotkey(e);
+      if (captured.kind === "unsupported") {
+        // Keep listening — the user just has to pick a key we can register.
+        setHotkeyHint("That key can't be used in a shortcut. Try a letter, number, or function key.");
+        return;
+      }
+      if (captured.kind === "accelerator") {
+        setSettings({ ...settings, [capturingField]: captured.accelerator });
         setCapturingField(null);
+        setHotkeyHint(null);
         setDirty(true);
       }
     };
@@ -260,41 +220,6 @@ export default function SettingsPage() {
     }
   }, []);
 
-  // ─── Download Granite model ───
-  const handleDownloadGranite = useCallback(async () => {
-    setDownloadingGranite(true);
-    setDownloadProgress(0);
-    try {
-      await invoke("download_granite_model");
-      const ready = await invoke<boolean>("is_granite_model_ready");
-      setGraniteReady(ready);
-    } catch (e) {
-      console.error("Granite download failed:", e);
-    } finally {
-      setDownloadingGranite(false);
-    }
-  }, []);
-
-  // ─── Start Granite server ───
-  const handleStartGraniteServer = useCallback(async () => {
-    try {
-      await invoke("start_granite_server");
-      setGraniteServerRunning(true);
-    } catch (e) {
-      console.error("Granite server start failed:", e);
-    }
-  }, []);
-
-  // ─── Stop Granite server ───
-  const handleStopGraniteServer = useCallback(async () => {
-    try {
-      await invoke("stop_granite_server");
-      setGraniteServerRunning(false);
-    } catch (e) {
-      console.error("Granite server stop failed:", e);
-    }
-  }, []);
-
   if (!settings) {
     return <div className="settings-page"><p>Loading...</p></div>;
   }
@@ -359,16 +284,6 @@ export default function SettingsPage() {
               <span className="mode-icon">🇻🇳</span>
               <span className="mode-label">Zipformer</span>
               <span className="mode-desc">Vietnamese · Ultra-fast</span>
-            </button>
-            <button
-              type="button"
-              className={`mode-btn ${settings.transcription_mode === "local" && settings.local_engine === "granite" ? "active" : ""}`}
-              onClick={() => update({ transcription_mode: "local", local_engine: "granite" })}
-              aria-pressed={settings.transcription_mode === "local" && settings.local_engine === "granite"}
-            >
-              <span className="mode-icon">🪨</span>
-              <span className="mode-label">Granite</span>
-              <span className="mode-desc">IBM · Multilingual</span>
             </button>
           </div>
         </section>
@@ -536,77 +451,6 @@ export default function SettingsPage() {
           </section>
         )}
 
-        {/* ─── Granite Model Download (only in granite mode) ─── */}
-        {settings.transcription_mode === "local" && settings.local_engine === "granite" && (
-          <section className="settings-section">
-            <h2>Granite 4.0 1B Speech</h2>
-            <div className={`model-card active ${graniteReady ? "downloaded" : ""}`}>
-              <div className="model-card-header">
-                <span className="model-label">Granite 4.0 1B Speech (IBM)</span>
-                <span className="model-size">~2 GB</span>
-              </div>
-              <div className="model-card-actions">
-                {graniteReady ? (
-                  <button className="btn btn-sm btn-active" disabled>
-                    ✅ Downloaded
-                  </button>
-                ) : downloadingGranite ? (
-                  <div className="download-bar-inline">
-                    <div
-                      className="download-bar-fill"
-                      style={{ width: `${downloadProgress}%` }}
-                    />
-                    <span>{Math.round(downloadProgress)}%</span>
-                  </div>
-                ) : (
-                  <button
-                    className="btn btn-sm btn-download"
-                    onClick={handleDownloadGranite}
-                  >
-                    Download
-                  </button>
-                )}
-              </div>
-            </div>
-
-            {/* Server status */}
-            {graniteReady && (
-              <div className="server-status">
-                <div className="server-status-row">
-                  <span className={`server-status-dot ${graniteServerRunning ? "running" : "stopped"}`} />
-                  <span className="server-status-label">
-                    Server {graniteServerRunning ? "running" : "stopped"}
-                  </span>
-                  {graniteServerRunning ? (
-                    <button
-                      type="button"
-                      className="btn btn-sm btn-danger"
-                      onClick={handleStopGraniteServer}
-                    >
-                      Stop Server
-                    </button>
-                  ) : (
-                    <button
-                      type="button"
-                      className="btn btn-sm btn-download"
-                      onClick={handleStartGraniteServer}
-                    >
-                      Start Server
-                    </button>
-                  )}
-                </div>
-              </div>
-            )}
-
-            <p className="hint">
-              🌐 Multilingual ASR · EN, FR, DE, ES, PT, JA · Requires Python + PyTorch
-            </p>
-            <p className="hint granite-prerequisite">
-              Prerequisites: <code>pip install -r scripts/requirements.txt</code>
-            </p>
-          </section>
-        )}
-
         {/* ─── Language ─── */}
         <section className="settings-section">
           <div className="section-heading compact">
@@ -614,8 +458,6 @@ export default function SettingsPage() {
           </div>
           {settings.local_engine === "zipformer" && settings.transcription_mode === "local" ? (
             <p className="hint">🇻🇳 Zipformer engine only supports Vietnamese. Switch to Whisper or Cloud for other languages.</p>
-          ) : settings.local_engine === "granite" && settings.transcription_mode === "local" ? (
-            <p className="hint">🌐 Granite supports: English, French, German, Spanish, Portuguese, Japanese</p>
           ) : (
             <>
               {isEnModel && settings.language === "en" && (
@@ -667,7 +509,10 @@ export default function SettingsPage() {
             <button
               type="button"
               className={`hotkey-btn ${capturingField === "hotkey" ? "capturing" : ""}`}
-              onClick={() => setCapturingField("hotkey")}
+              onClick={() => {
+                setCapturingField("hotkey");
+                setHotkeyHint(null);
+              }}
             >
               {capturingField === "hotkey" ? "Press keys..." : formatHotkey(settings.hotkey)}
             </button>
@@ -677,11 +522,15 @@ export default function SettingsPage() {
             <button
               type="button"
               className={`hotkey-btn ${capturingField === "quit_hotkey" ? "capturing" : ""}`}
-              onClick={() => setCapturingField("quit_hotkey")}
+              onClick={() => {
+                setCapturingField("quit_hotkey");
+                setHotkeyHint(null);
+              }}
             >
               {capturingField === "quit_hotkey" ? "Press keys..." : formatHotkey(settings.quit_hotkey)}
             </button>
           </div>
+          {hotkeyHint && <p className="hint hint-warn">{hotkeyHint}</p>}
         </section>
 
         {/* ─── Footer ─── */}

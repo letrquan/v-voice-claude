@@ -1392,48 +1392,6 @@ html, body, #root {
   box-shadow: 0 0 8px rgba(255, 189, 102, 0.55);
 }
 
-.server-status {
-  margin-top: 12px;
-  padding: 10px 12px;
-  border: 1px solid rgba(255, 255, 255, 0.06);
-  border-radius: 10px;
-  background: rgba(5, 7, 11, 0.28);
-}
-
-.server-status-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.server-status-row .btn { margin-left: auto; }
-
-.server-status-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-}
-
-.server-status-dot.running {
-  background: #50e3a4;
-  box-shadow: 0 0 8px rgba(80, 227, 164, 0.55);
-}
-
-.server-status-dot.stopped {
-  background: var(--danger);
-  box-shadow: 0 0 8px rgba(255, 111, 145, 0.45);
-}
-
-.server-status-label {
-  color: rgba(246, 247, 251, 0.72);
-  font-size: 12px;
-}
-
-.granite-prerequisite {
-  margin-top: 4px;
-  font-size: 11px;
-}
-
 @media (min-width: 768px) {
   .settings-container { padding: 12px 20px 24px; }
 }
@@ -1486,4 +1444,9 @@ html, body, #root {
     animation-iteration-count: 1 !important;
     scroll-behavior: auto !important;
   }
+}
+
+/* A hint that reports a problem rather than offering advice. */
+.hint.hint-warn {
+  color: var(--warn);
 }

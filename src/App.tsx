@@ -6,8 +6,31 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { LogicalSize, LogicalPosition } from "@tauri-apps/api/dpi";
 import { Waveform } from "./components/Waveform";
 import { useAudioCapture } from "./hooks/useAudioCapture";
+import { formatHotkey } from "./lib/hotkey";
+import { log, startLogSession, endLogSession } from "./lib/log";
 
-type AppState = "idle" | "listening" | "processing";
+/** "error" holds the pill open just long enough to read what went wrong. */
+type AppState = "idle" | "listening" | "processing" | "error";
+
+type ErrorKind = "download" | "init" | "transcribe" | "mic" | "hotkey";
+
+interface AppError {
+  kind: ErrorKind;
+  message: string;
+}
+
+/** Only asset problems have anything to retry; the rest just need dismissing. */
+function isRetryable(error: AppError): boolean {
+  return error.kind === "download" || error.kind === "init";
+}
+
+function formatError(e: unknown): string {
+  const raw =
+    typeof e === "string" ? e : e instanceof Error ? e.message : String(e);
+  const trimmed = raw.trim();
+  if (!trimmed) return "Unknown error";
+  return trimmed.length > 180 ? `${trimmed.slice(0, 177)}...` : trimmed;
+}
 
 interface AppSettings {
   model: string;
@@ -50,11 +73,14 @@ const SIZE_TALL = { w: 260, h: 120 };
 /* ─── Timing ─── */
 const TRANSITION_MS = 420;
 const SHOW_TRANSCRIPT_DELAY = 300;
+const ERROR_HOLD_MS = 2600; // how long a failure stays readable before collapsing
 const STREAMING_CHUNK_MS = 2000; // collect audio every 2s
 const STREAMING_WINDOW_DURATION = 4; // enough context without delaying first text
 const STREAMING_OVERLAP_DURATION = 0.65; // preserve boundary phonemes
 const STREAMING_PREROLL_DURATION = 0.5; // retain speech onset without decoding silence
 const MIN_FINAL_CHUNK_DURATION = 0.25; // minimum seconds for the final chunk
+/** Backstop for a hotkey release that never arrives, so the mic cannot stay open forever. */
+const MAX_HOLD_MS = 120000;
 
 function appendAudio(existing: Float32Array | null, incoming: Float32Array): Float32Array {
   if (!existing || existing.length === 0) return incoming;
@@ -122,13 +148,35 @@ function App() {
   const [downloadProgress, setDownloadProgress] = useState(0);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [showTranscript, setShowTranscript] = useState(false);
-  const [errorMsg, setErrorMsg] = useState("");
+  const [error, setError] = useState<AppError | null>(null);
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
 
   const stateRef = useRef<AppState>("idle");
   const modelReadyRef = useRef(false);
   const settingsRef = useRef<AppSettings>(DEFAULT_SETTINGS);
   const vadArcRef = useRef<SVGCircleElement>(null);
+  const errorRef = useRef<AppError | null>(null);
+
+  // Bumped on every new listening session so a teardown that is still awaiting
+  // a timer cannot stomp the session that replaced it.
+  const sessionRef = useRef(0);
+
+  const applyError = useCallback((next: AppError | null) => {
+    errorRef.current = next;
+    setError(next);
+  }, []);
+
+  // ─── Hold-to-talk state ───
+  // The hotkey is hold-to-talk, so while the keys are physically down the
+  // session must survive silence: VAD auto-stop only applies once released.
+  const hotkeyHeldRef = useRef(false);
+  // Windows repeats WM_HOTKEY while a shortcut is held; counted, not acted on.
+  const pressRepeatsRef = useRef(0);
+  // A release that lands before the session finished opening the mic would
+  // otherwise be dropped, leaving the pill listening with nobody holding a key.
+  const startingRef = useRef(false);
+  const pendingReleaseRef = useRef(false);
+  const holdWatchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // VAD state refs
   const silenceStartMsRef = useRef<number>(0);
@@ -148,6 +196,9 @@ function App() {
   const streamingPendingRef = useRef<Float32Array | null>(null);
   const streamingSampleRateRef = useRef(16000);
   const discardStreamingRef = useRef(false);
+  // Streaming retries quietly, so the last failure is only worth showing if the
+  // whole session ended up producing nothing.
+  const lastStreamErrorRef = useRef<string | null>(null);
 
   const transcriptScrollRef = useRef<HTMLDivElement>(null);
 
@@ -220,7 +271,10 @@ function App() {
       }
 
       const elapsedMs = now - silenceStartMsRef.current;
-      const prog = Math.min(elapsedMs / targetSilenceMs, 1);
+      // While the hotkey is held the countdown ring would only promise a stop
+      // that is not going to happen, so it stays empty.
+      const held = hotkeyHeldRef.current;
+      const prog = held ? 0 : Math.min(elapsedMs / targetSilenceMs, 1);
 
       if (vadArcRef.current) {
         vadArcRef.current.style.strokeDashoffset = (VAD_DEFAULTS.RING_CIRC * (1 - prog)).toFixed(2);
@@ -233,7 +287,23 @@ function App() {
         if (vadArcRef.current) {
           vadArcRef.current.style.strokeDashoffset = String(VAD_DEFAULTS.RING_CIRC);
         }
+        if (held) {
+          // Hold-to-talk: a pause between sentences is not the end of the take.
+          log("vad.pause-ignored-while-held", {
+            silenceMs: Math.round(elapsedMs),
+            targetSilenceMs: Math.round(targetSilenceMs),
+            rms: Number(rms.toFixed(4)),
+          });
+          return;
+        }
         if (stateRef.current === "listening") {
+          log("vad.auto-stop", {
+            silenceMs: Math.round(elapsedMs),
+            targetSilenceMs: Math.round(targetSilenceMs),
+            rms: Number(rms.toFixed(4)),
+            noiseFloor: Number(noiseFloorRef.current.toFixed(4)),
+            threshold: Number(adaptiveThreshold.toFixed(4)),
+          });
           toggleRef.current();
         }
       }
@@ -243,6 +313,13 @@ function App() {
   // ─── Close button (cancel listening) ───
   const handleClose = useCallback(async () => {
     if (stateRef.current === "listening") {
+      const session = sessionRef.current;
+      log("session.cancelled", { session });
+      hotkeyHeldRef.current = false;
+      if (holdWatchdogRef.current) {
+        clearTimeout(holdWatchdogRef.current);
+        holdWatchdogRef.current = null;
+      }
       discardStreamingRef.current = true;
       // Stop streaming
       if (streamingIntervalRef.current) {
@@ -253,11 +330,14 @@ function App() {
       committedTextRef.current = "";
       streamingPendingRef.current = null;
       speechDetectedRef.current = false;
+      lastStreamErrorRef.current = null;
 
       if (streamingTaskRef.current) {
         await streamingTaskRef.current;
       }
       await stop();
+      if (sessionRef.current !== session) return;
+      applyError(null);
       setState("idle");
       stateRef.current = "idle";
       setShowTranscript(false);
@@ -267,10 +347,11 @@ function App() {
       isSpeakingRef.current = false;
       speechDetectedRef.current = false;
       await new Promise((r) => setTimeout(r, TRANSITION_MS));
+      if (sessionRef.current !== session) return;
       await resizeInPlace(SIZE_IDLE.w, SIZE_IDLE.h);
       setTranscript("");
     }
-  }, [stop]);
+  }, [stop, applyError]);
 
   // ─── Quit app ───
   const handleQuit = useCallback(async () => {
@@ -288,18 +369,48 @@ function App() {
     await getCurrentWindow().close();
   }, [stop]);
 
+  // ─── Show a failure in the expanded pill, then settle back to idle ───
+  // The pill is 48px when idle, so a message only fits while it is expanded.
+  const showErrorThenIdle = useCallback(
+    async (session: number, appError: AppError) => {
+      applyError(appError);
+      setState("error");
+      stateRef.current = "error";
+      setIsSpeaking(false);
+      setShowTranscript(true);
+      await resizeInPlace(SIZE_TALL.w, SIZE_TALL.h);
+      await new Promise((r) => setTimeout(r, ERROR_HOLD_MS));
+      if (sessionRef.current !== session) return;
+
+      setState("idle");
+      stateRef.current = "idle";
+      setShowTranscript(false);
+      await new Promise((r) => setTimeout(r, TRANSITION_MS));
+      if (sessionRef.current !== session) return;
+      await resizeInPlace(SIZE_IDLE.w, SIZE_IDLE.h);
+    },
+    [applyError]
+  );
+
   // ─── Toggle: idle -> listening -> processing -> idle ───
   const handleToggle = useCallback(async () => {
     const currentState = stateRef.current;
 
-    if (currentState === "idle" && modelReadyRef.current) {
+    // "error" is just idle holding a message, so a new session can start from it.
+    if ((currentState === "idle" || currentState === "error") && modelReadyRef.current) {
+      const session = (sessionRef.current += 1);
+      startLogSession();
+      log("session.start", { session, hotkeyHeld: hotkeyHeldRef.current });
+      startingRef.current = true;
+      pendingReleaseRef.current = false;
       silenceStartMsRef.current = 0;
       speechFramesRef.current = 0;
       isSpeakingRef.current = false;
       setIsSpeaking(false);
       setTranscript("");
       setShowTranscript(false);
-      setErrorMsg("");
+      applyError(null);
+      lastStreamErrorRef.current = null;
       streamingBusyRef.current = false;
       vadWarmupUntilRef.current = Date.now() + 1200; // 1.2s grace period for mic warm-up
       noiseFloorRef.current = Math.max(0.003, settingsRef.current.vad_silence_threshold / 3);
@@ -313,7 +424,17 @@ function App() {
       stateRef.current = "listening";
 
       // Pass microphone deviceId from settings
-      await start(settingsRef.current.microphone_id || undefined);
+      try {
+        await start(settingsRef.current.microphone_id || undefined);
+        log("mic.started");
+      } catch (e) {
+        startingRef.current = false;
+        pendingReleaseRef.current = false;
+        log("mic.error", { message: formatError(e) });
+        if (sessionRef.current !== session) return;
+        await showErrorThenIdle(session, { kind: "mic", message: formatError(e) });
+        return;
+      }
 
       setTimeout(async () => {
         if (stateRef.current === "listening") {
@@ -358,6 +479,10 @@ function App() {
               sampleRate,
               prompt: committedTextRef.current.slice(-250),
             });
+            log("stream.chunk", {
+              seconds: Number((window.length / sampleRate).toFixed(2)),
+              text: chunkText.trim().slice(0, 120),
+            });
             const delta = mergeTranscript(committedTextRef.current, chunkText);
             if (delta && !discardStreamingRef.current) {
               const textToType = committedTextRef.current ? " " + delta : delta;
@@ -374,8 +499,12 @@ function App() {
             streamingPendingRef.current = pending.slice(
               Math.max(0, windowSamples - overlapSamples)
             );
-          } catch {
-            // Keep the window queued so a transient failure does not lose audio.
+            lastStreamErrorRef.current = null;
+          } catch (e) {
+            // Keep the window queued so a transient failure does not lose audio,
+            // but remember why in case the session never produces any text.
+            lastStreamErrorRef.current = formatError(e);
+            log("stream.error", { message: lastStreamErrorRef.current });
           } finally {
             streamingBusyRef.current = false;
           }
@@ -386,7 +515,42 @@ function App() {
         });
       }, STREAMING_CHUNK_MS);
 
+      // If the shortcut plugin ever loses a release, nothing else would close
+      // the mic now that VAD stands down while held.
+      if (holdWatchdogRef.current) clearTimeout(holdWatchdogRef.current);
+      holdWatchdogRef.current = setTimeout(() => {
+        holdWatchdogRef.current = null;
+        if (sessionRef.current !== session) return;
+        if (stateRef.current !== "listening") return;
+        log("hold.watchdog-stop", { maxHoldMs: MAX_HOLD_MS });
+        hotkeyHeldRef.current = false;
+        toggleRef.current();
+      }, MAX_HOLD_MS);
+
+      startingRef.current = false;
+
+      // The key was let go while the mic was still opening — honour it now
+      // instead of listening on with nobody holding anything.
+      if (pendingReleaseRef.current) {
+        pendingReleaseRef.current = false;
+        log("hotkey.released-during-start", { session });
+        void toggleRef.current();
+      }
+
     } else if (currentState === "listening") {
+      const session = sessionRef.current;
+      log("session.stop", {
+        session,
+        hotkeyHeld: hotkeyHeldRef.current,
+        speechDetected: speechDetectedRef.current,
+        committedChars: committedTextRef.current.length,
+      });
+
+      if (holdWatchdogRef.current) {
+        clearTimeout(holdWatchdogRef.current);
+        holdWatchdogRef.current = null;
+      }
+
       // ─── Stop streaming interval ───
       if (streamingIntervalRef.current) {
         clearInterval(streamingIntervalRef.current);
@@ -411,6 +575,7 @@ function App() {
       // Transcribe and type remaining audio
       const pendingFinal = streamingPendingRef.current;
       const finalSampleRate = remainingAudio?.sampleRate ?? streamingSampleRateRef.current;
+      let finalError: string | null = null;
       if (speechDetectedRef.current
         && pendingFinal
         && pendingFinal.length > finalSampleRate * MIN_FINAL_CHUNK_DURATION) {
@@ -430,28 +595,47 @@ function App() {
           streamingPendingRef.current = null;
         } catch (e) {
           console.error("Final chunk transcription error:", e);
-          setErrorMsg(String(e));
+          finalError = formatError(e);
+          log("final.error", { message: finalError });
         }
       }
+      log("session.done", { session, transcript: committedTextRef.current.slice(0, 200) });
+      endLogSession();
 
-      setState("idle");
-      stateRef.current = "idle";
-      setShowTranscript(false);
-      setIsSpeaking(false);
-      await new Promise((r) => setTimeout(r, TRANSITION_MS));
-      await resizeInPlace(SIZE_IDLE.w, SIZE_IDLE.h);
+      if (sessionRef.current !== session) return;
+
+      // Report the final chunk's failure, or — when the session produced no text
+      // at all — the streaming failure that has been retrying invisibly.
+      const failure =
+        finalError ??
+        (committedTextRef.current ? null : lastStreamErrorRef.current);
+
+      if (failure) {
+        await showErrorThenIdle(session, { kind: "transcribe", message: failure });
+      } else {
+        setState("idle");
+        stateRef.current = "idle";
+        setShowTranscript(false);
+        setIsSpeaking(false);
+        await new Promise((r) => setTimeout(r, TRANSITION_MS));
+        if (sessionRef.current !== session) return;
+        await resizeInPlace(SIZE_IDLE.w, SIZE_IDLE.h);
+      }
+
+      if (sessionRef.current !== session) return;
 
       // Save pill position after settling back to idle
       savePillPosition();
 
       setTimeout(() => {
+        if (sessionRef.current !== session) return;
         setTranscript("");
         committedTextRef.current = "";
         streamingPendingRef.current = null;
         discardStreamingRef.current = false;
       }, 2000);
     }
-  }, [start, stop, consumeBuffer]);
+  }, [start, stop, consumeBuffer, applyError, showErrorThenIdle]);
 
   const toggleRef = useRef(handleToggle);
   useEffect(() => {
@@ -495,19 +679,31 @@ function App() {
     };
   }, [savePillPosition]);
 
-  // ─── Retry download ───
-  const handleRetry = useCallback(() => {
-    setErrorMsg("");
-    setDownloadProgress(0);
+  // ─── Start the local model download, reporting why it failed ───
+  const startModelDownload = useCallback(() => {
     const s = settingsRef.current;
-    const downloadCmd = s.local_engine === "zipformer" ? "download_zipformer_model" : "download_model";
+    setDownloadProgress(0);
+    const downloadCmd =
+      s.local_engine === "zipformer" ? "download_zipformer_model" : "download_model";
     invoke(downloadCmd)
       .then(() => setModelReady(true))
       .catch((e) => {
-        console.error("Retry download error:", e);
-        setErrorMsg("Download failed. Click to retry.");
+        console.error("Download error:", e);
+        applyError({ kind: "download", message: `Download failed: ${formatError(e)}` });
       });
-  }, []);
+  }, [applyError]);
+
+  // ─── Click the error pill: retry what can be retried, dismiss the rest ───
+  const handleRetry = useCallback(() => {
+    const current = errorRef.current;
+    applyError(null);
+
+    if (!current || !isRetryable(current)) return;
+    // Cloud mode has nothing local to fetch.
+    if (settingsRef.current.transcription_mode === "cloud") return;
+
+    startModelDownload();
+  }, [applyError, startModelDownload]);
 
   // ─── Register / re-register hotkeys ───
   const registerHotkeys = useCallback(async (s: AppSettings) => {
@@ -519,25 +715,66 @@ function App() {
     try { await unregister(s.quit_hotkey); } catch {}
 
     // Register hold-to-talk
-    await register(s.hotkey, (event: any) => {
-      if (event.state === "Pressed") {
-        if (stateRef.current === "idle") {
-          toggleRef.current();
+    const failed: string[] = [];
+    try {
+      await register(s.hotkey, (event: any) => {
+        if (event.state === "Pressed") {
+          // Windows re-fires the shortcut while it is held down; only the first
+          // press opens a session, the rest are auto-repeat.
+          if (hotkeyHeldRef.current && (startingRef.current || stateRef.current === "listening")) {
+            pressRepeatsRef.current += 1;
+            return;
+          }
+          hotkeyHeldRef.current = true;
+          pressRepeatsRef.current = 0;
+          log("hotkey.pressed", { state: stateRef.current });
+          if (stateRef.current === "idle" || stateRef.current === "error") {
+            toggleRef.current();
+          }
+        } else if (event.state === "Released") {
+          const wasHeld = hotkeyHeldRef.current;
+          hotkeyHeldRef.current = false;
+          log("hotkey.released", {
+            state: stateRef.current,
+            wasHeld,
+            repeats: pressRepeatsRef.current,
+            starting: startingRef.current,
+          });
+          pressRepeatsRef.current = 0;
+          if (stateRef.current === "listening") {
+            toggleRef.current();
+          } else if (startingRef.current) {
+            // The mic is still opening; handleToggle picks this up once it is up.
+            pendingReleaseRef.current = true;
+          }
         }
-      } else if (event.state === "Released") {
-        if (stateRef.current === "listening") {
-          toggleRef.current();
-        }
-      }
-    });
+      });
+    } catch (e) {
+      console.error("Failed to register hold-to-talk hotkey:", e);
+      failed.push(formatHotkey(s.hotkey));
+    }
 
     // Register quit
-    await register(s.quit_hotkey, (event: any) => {
-      if (!event.state || event.state === "Pressed") {
-        quitRef.current();
-      }
-    });
-  }, []);
+    try {
+      await register(s.quit_hotkey, (event: any) => {
+        if (!event.state || event.state === "Pressed") {
+          quitRef.current();
+        }
+      });
+    } catch (e) {
+      console.error("Failed to register quit hotkey:", e);
+      failed.push(formatHotkey(s.quit_hotkey));
+    }
+
+    // A hotkey that silently fails to register leaves no way to talk at all,
+    // so say so rather than logging it to a console nobody is watching.
+    if (failed.length > 0) {
+      applyError({
+        kind: "hotkey",
+        message: `Could not register ${failed.join(" and ")}. Another app may already use it — pick a different shortcut in Settings.`,
+      });
+    }
+  }, [applyError]);
 
   // ─── Load settings + model on mount ───
   useEffect(() => {
@@ -562,18 +799,12 @@ function App() {
       .then((ready) => {
         setModelReady(ready);
         if (!ready && settingsRef.current.transcription_mode !== "cloud") {
-          const downloadCmd = settingsRef.current.local_engine === "zipformer" ? "download_zipformer_model" : "download_model";
-          invoke(downloadCmd)
-            .then(() => setModelReady(true))
-            .catch((e) => {
-              console.error("Download error:", e);
-              setErrorMsg("Download failed. Click to retry.");
-            });
+          startModelDownload();
         }
       })
       .catch((e) => {
         console.error("Init error:", e);
-        setErrorMsg("Failed to initialize. Click to retry.");
+        applyError({ kind: "init", message: `Could not start: ${formatError(e)}` });
         // Still register default hotkeys
         registerHotkeys(DEFAULT_SETTINGS).catch(console.error);
       });
@@ -616,13 +847,7 @@ function App() {
             const ready = await invoke<boolean>(readyCmd);
             setModelReady(ready);
             if (!ready) {
-              const downloadCmd = s.local_engine === "zipformer" ? "download_zipformer_model" : "download_model";
-              invoke(downloadCmd)
-                .then(() => setModelReady(true))
-                .catch((e) => {
-                  console.error("Download error:", e);
-                  setErrorMsg("Download failed. Click to retry.");
-                });
+              startModelDownload();
             }
           }
         }
@@ -639,15 +864,15 @@ function App() {
       unregister(s.hotkey).catch(() => {});
       unregister(s.quit_hotkey).catch(() => {});
     };
-  }, [registerHotkeys]);
+  }, [registerHotkeys, applyError, startModelDownload]);
 
   // ─── Build CSS classes for #pill ───
   const pillClasses: string[] = [];
 
-  if (!modelReady && !errorMsg) {
+  if (!modelReady && !error) {
     pillClasses.push("downloading");
   }
-  if (errorMsg && state === "idle") {
+  if (error && state === "idle") {
     pillClasses.push("has-error");
   }
   if (state === "listening") {
@@ -656,7 +881,10 @@ function App() {
   if (state === "processing") {
     pillClasses.push("expanded", "processing");
   }
-  if (showTranscript && (state === "listening" || state === "processing")) {
+  if (state === "error") {
+    pillClasses.push("expanded");
+  }
+  if (showTranscript && state !== "idle") {
     pillClasses.push("show-transcript");
   }
   if (isSpeaking && state === "listening") {
@@ -671,10 +899,17 @@ function App() {
       id="pill"
       className={pillClasses.join(" ")}
       data-tauri-drag-region
-      onClick={errorMsg && state === "idle" ? handleRetry : undefined}
+      title={
+        error
+          ? isRetryable(error)
+            ? `${error.message} — click to retry`
+            : `${error.message} — click to dismiss`
+          : undefined
+      }
+      onClick={error && state === "idle" ? handleRetry : undefined}
     >
       {/* ─── Quit button ─── */}
-      <button className="quit-btn" onClick={handleQuit} title={`Quit (${settings.quit_hotkey.replace("CommandOrControl", "Ctrl").replace(/\+/g, "+")})`}>
+      <button className="quit-btn" onClick={handleQuit} title={`Quit (${formatHotkey(settings.quit_hotkey)})`}>
         &#x2715;
       </button>
 
@@ -756,8 +991,8 @@ function App() {
       {/* ─── Transcript row ─── */}
       <div className="transcript-row" ref={transcriptScrollRef} data-tauri-drag-region>
         <div className="tx" data-tauri-drag-region>
-          {errorMsg && state !== "idle" ? (
-            <span className="tx-error">{errorMsg}</span>
+          {error && state !== "idle" ? (
+            <span className="tx-error">{error.message}</span>
           ) : state === "processing" ? (
             <span className="tx-pending">finalizing...</span>
           ) : transcript && state === "listening" ? (

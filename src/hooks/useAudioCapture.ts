@@ -5,6 +5,26 @@ export interface AudioData {
   sampleRate: number;
 }
 
+/** Turn a getUserMedia rejection into something worth showing a user. */
+function describeCaptureError(err: unknown): string {
+  const name = err instanceof DOMException ? err.name : "";
+  switch (name) {
+    case "NotAllowedError":
+    case "SecurityError":
+      return "Microphone access was denied.";
+    case "NotFoundError":
+      return "No microphone was found.";
+    case "OverconstrainedError":
+      return "The selected microphone is unavailable. Pick another in Settings.";
+    case "NotReadableError":
+      return "The microphone is in use by another app.";
+    default:
+      return `Could not start the microphone: ${
+        err instanceof Error ? err.message : String(err)
+      }`;
+  }
+}
+
 export function useAudioCapture() {
   const [analyserNode, setAnalyserNode] = useState<AnalyserNode | null>(null);
   const [isCapturing, setIsCapturing] = useState(false);
@@ -17,7 +37,36 @@ export function useAudioCapture() {
   const samplesRef = useRef<Float32Array[]>([]);
   const sampleCountRef = useRef(0);
 
-  /** Start capture. Pass a deviceId to use a specific microphone, or "" for default. */
+  /** Tear down every node, the media stream, and the context. Safe to call twice. */
+  const releaseResources = useCallback(async () => {
+    sourceRef.current?.disconnect();
+    sourceRef.current = null;
+    workletNodeRef.current?.disconnect();
+    workletNodeRef.current = null;
+    sinkNodeRef.current?.disconnect();
+    sinkNodeRef.current = null;
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
+
+    if (audioContextRef.current) {
+      try {
+        await audioContextRef.current.close();
+      } catch {
+        // Already closed
+      }
+      audioContextRef.current = null;
+    }
+
+    setAnalyserNode(null);
+    setIsCapturing(false);
+    samplesRef.current = [];
+    sampleCountRef.current = 0;
+  }, []);
+
+  /** Start capture. Pass a deviceId to use a specific microphone, or "" for default.
+   *  Rejects if the microphone cannot be opened — the caller must not assume
+   *  that returning means audio is flowing.
+   */
   const start = useCallback(async (deviceId?: string) => {
     try {
       const audioConstraints: MediaTrackConstraints = {
@@ -83,9 +132,12 @@ export function useAudioCapture() {
       workletNode.port.postMessage({ command: "start" });
       setIsCapturing(true);
     } catch (err) {
-      console.error("Failed to start audio capture:", err);
+      // Roll back anything that did open, then let the caller show the reason
+      // instead of leaving a widget that looks live and records nothing.
+      await releaseResources();
+      throw new Error(describeCaptureError(err));
     }
-  }, []);
+  }, [releaseResources]);
 
   /** Get a snapshot of the accumulated audio buffer without stopping recording. */
   const getBuffer = useCallback((): AudioData | null => {
@@ -152,30 +204,10 @@ export function useAudioCapture() {
       offset += chunk.length;
     }
 
-    // Cleanup
-    if (sourceRef.current) {
-      sourceRef.current.disconnect();
-      sourceRef.current = null;
-    }
-    if (workletNodeRef.current) {
-      workletNodeRef.current.disconnect();
-    }
-    if (sinkNodeRef.current) {
-      sinkNodeRef.current.disconnect();
-      sinkNodeRef.current = null;
-    }
-    streamRef.current?.getTracks().forEach((track) => track.stop());
-    await audioContextRef.current.close();
-
-    setAnalyserNode(null);
-    setIsCapturing(false);
-    audioContextRef.current = null;
-    workletNodeRef.current = null;
-    samplesRef.current = [];
-    sampleCountRef.current = 0;
+    await releaseResources();
 
     return { samples: allSamples, sampleRate };
-  }, []);
+  }, [releaseResources]);
 
   return { start, stop, getBuffer, consumeBuffer, analyserNode, isCapturing };
 }

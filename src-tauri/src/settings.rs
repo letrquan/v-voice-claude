@@ -162,7 +162,13 @@ pub fn load_settings(app: &tauri::AppHandle) -> AppSettings {
     let store = app.store(STORE_FILENAME).ok();
     if let Some(store) = store {
         if let Some(val) = store.get(STORE_KEY) {
-            if let Ok(settings) = serde_json::from_value::<AppSettings>(val.clone()) {
+            if let Ok(mut settings) = serde_json::from_value::<AppSettings>(val.clone()) {
+                // The Granite engine is hidden until its Python server ships
+                // with the installer. Anyone who selected it would otherwise be
+                // stuck on an engine that cannot start.
+                if settings.local_engine == "granite" {
+                    settings.local_engine = default_local_engine();
+                }
                 return settings;
             }
         }
@@ -184,7 +190,7 @@ fn save_settings(app: &tauri::AppHandle, settings: &AppSettings) -> Result<(), S
 }
 
 /// Returns the base data directory
-fn data_dir() -> PathBuf {
+pub fn data_dir() -> PathBuf {
     let base = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
     base.join("v-voice-claude")
 }

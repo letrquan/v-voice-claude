@@ -22,7 +22,7 @@ hound = "3.5"
 zip = "2"
 enigo = { version = "0.2", features = [] }
 reqwest = { version = "0.12", features = ["stream", "multipart", "json"] }
-tokio = { version = "1", features = ["fs", "sync", "process"] }
+tokio = { version = "1", features = ["fs", "io-util", "sync", "process"] }
 dirs = "6"
 futures-util = "0.3"
 

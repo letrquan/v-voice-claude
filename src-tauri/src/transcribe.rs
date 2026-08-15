@@ -1,11 +1,12 @@
 use std::io::{Cursor, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use tauri::Emitter;
+use tokio::io::AsyncWriteExt;
 
 use crate::settings;
 
@@ -297,18 +298,79 @@ pub fn is_ready(model_id: &str) -> bool {
     model_path(model_id).exists() && cli_path().exists() && server_path().exists()
 }
 
-/// Download a URL into memory, emitting progress events.
+/// The slice of the overall progress bar that a single download owns.
+///
+/// Multi-file downloads used to emit an absolute 0-100 per file, so the bar
+/// swept back to zero for every one of them. Giving each transfer a range keeps
+/// the reported progress monotonic across the whole operation.
+#[derive(Clone, Copy)]
+struct ProgressRange {
+    start: f64,
+    end: f64,
+}
+
+impl ProgressRange {
+    const FULL: ProgressRange = ProgressRange {
+        start: 0.0,
+        end: 100.0,
+    };
+
+    fn new(start: f64, end: f64) -> Self {
+        Self { start, end }
+    }
+
+    /// Map a 0.0-1.0 fraction of this transfer onto the overall bar.
+    fn at(&self, fraction: f64) -> f64 {
+        self.start + (self.end - self.start) * fraction.clamp(0.0, 1.0)
+    }
+}
+
+fn emit_progress(app: &tauri::AppHandle, value: f64) {
+    let _ = app.emit("download-progress", value);
+}
+
+/// Emit at most one event per half a percent so a multi-gigabyte download does
+/// not flood the frontend with one message per chunk.
+fn report_progress(
+    app: &tauri::AppHandle,
+    range: ProgressRange,
+    downloaded: u64,
+    total: u64,
+    last_emitted: &mut f64,
+) {
+    if total == 0 {
+        return;
+    }
+    let value = range.at(downloaded as f64 / total as f64);
+    if value - *last_emitted >= 0.5 {
+        *last_emitted = value;
+        emit_progress(app, value);
+    }
+}
+
+/// Start a download, failing on non-2xx so an error page is never mistaken for
+/// the file we asked for.
+async fn begin_download(url: &str, label: &str) -> Result<reqwest::Response, String> {
+    reqwest::get(url)
+        .await
+        .map_err(|e| format!("{} download failed: {}", label, e))?
+        .error_for_status()
+        .map_err(|e| format!("{} download failed: {}", label, e))
+}
+
+/// Download a URL into memory, emitting progress events within `range`.
+/// Only for small files — anything model-sized should use `download_to_file`.
 async fn download_bytes(
     app: &tauri::AppHandle,
     url: &str,
     label: &str,
+    range: ProgressRange,
 ) -> Result<Vec<u8>, String> {
-    let response = reqwest::get(url)
-        .await
-        .map_err(|e| format!("{} download failed: {}", label, e))?;
+    let response = begin_download(url, label).await?;
 
     let total_size = response.content_length().unwrap_or(0);
     let mut downloaded: u64 = 0;
+    let mut last_emitted = -1.0_f64;
     let mut bytes = Vec::with_capacity(total_size as usize);
 
     let mut stream = response.bytes_stream();
@@ -316,14 +378,103 @@ async fn download_bytes(
         let chunk = chunk.map_err(|e| format!("{} download error: {}", label, e))?;
         downloaded += chunk.len() as u64;
         bytes.extend_from_slice(&chunk);
-
-        if total_size > 0 {
-            let progress = (downloaded as f64 / total_size as f64) * 100.0;
-            let _ = app.emit("download-progress", progress);
-        }
+        report_progress(app, range, downloaded, total_size, &mut last_emitted);
     }
 
+    emit_progress(app, range.at(1.0));
     Ok(bytes)
+}
+
+/// Stream a URL straight to disk.
+///
+/// The bytes go to a sibling `.part` file that is renamed into place only after
+/// the transfer completes. An interrupted download therefore leaves no file at
+/// all, rather than a truncated one that every later `exists()` check would
+/// report as a ready model.
+async fn download_to_file(
+    app: &tauri::AppHandle,
+    url: &str,
+    label: &str,
+    dest: &Path,
+    range: ProgressRange,
+) -> Result<(), String> {
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
+    }
+
+    let file_name = dest
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("Invalid destination for {}", label))?;
+    let temp = dest.with_file_name(format!("{}.part", file_name));
+    let _ = tokio::fs::remove_file(&temp).await;
+
+    match download_into(app, url, label, &temp, range).await {
+        Ok(()) => tokio::fs::rename(&temp, dest)
+            .await
+            .map_err(|e| format!("Failed to finalize {}: {}", label, e)),
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&temp).await;
+            Err(error)
+        }
+    }
+}
+
+async fn download_into(
+    app: &tauri::AppHandle,
+    url: &str,
+    label: &str,
+    temp: &Path,
+    range: ProgressRange,
+) -> Result<(), String> {
+    let response = begin_download(url, label).await?;
+
+    let total_size = response.content_length().unwrap_or(0);
+    let mut downloaded: u64 = 0;
+    let mut last_emitted = -1.0_f64;
+
+    let mut file = tokio::fs::File::create(temp)
+        .await
+        .map_err(|e| format!("Failed to create {}: {}", temp.display(), e))?;
+
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("{} download error: {}", label, e))?;
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| format!("Failed to write {}: {}", label, e))?;
+        downloaded += chunk.len() as u64;
+        report_progress(app, range, downloaded, total_size, &mut last_emitted);
+    }
+
+    file.flush()
+        .await
+        .map_err(|e| format!("Failed to flush {}: {}", label, e))?;
+    file.sync_all()
+        .await
+        .map_err(|e| format!("Failed to sync {}: {}", label, e))?;
+
+    emit_progress(app, range.at(1.0));
+    Ok(())
+}
+
+/// Write bytes through a `.part` file so a crash mid-write cannot leave a
+/// half-written executable behind.
+fn write_file_atomically(dest: &Path, bytes: &[u8]) -> Result<(), String> {
+    let file_name = dest
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("Invalid destination: {}", dest.display()))?;
+    let temp = dest.with_file_name(format!("{}.part", file_name));
+
+    std::fs::write(&temp, bytes)
+        .map_err(|e| format!("Failed to write {}: {}", file_name, e))?;
+    std::fs::rename(&temp, dest).map_err(|e| {
+        let _ = std::fs::remove_file(&temp);
+        format!("Failed to finalize {}: {}", file_name, e)
+    })
 }
 
 /// Download the specified GGML model and Whisper binaries (if not already present).
@@ -339,38 +490,42 @@ pub async fn download_model(app: tauri::AppHandle, model_id: &str) -> Result<(),
         .find(|m| m.id == model_id)
         .ok_or_else(|| format!("Unknown model: {}", model_id))?;
 
+    let needs_model = !model.exists();
+    let needs_binaries = !cli.exists() || !server.exists();
+
     // If all runtime files exist, nothing to do.
-    if model.exists() && cli.exists() && server.exists() {
-        let _ = app.emit("download-progress", 100.0_f64);
+    if !needs_model && !needs_binaries {
+        emit_progress(&app, 100.0);
         return Ok(());
     }
 
+    emit_progress(&app, 0.0);
+
+    // The model dwarfs the ~4 MB binary zip, so it owns almost the whole bar
+    // when both are needed.
+    let (model_range, binaries_range) = if needs_model && needs_binaries {
+        (
+            ProgressRange::new(0.0, 92.0),
+            ProgressRange::new(92.0, 100.0),
+        )
+    } else {
+        (ProgressRange::FULL, ProgressRange::FULL)
+    };
+
     // --- Download model ---
-    if !model.exists() {
-        let _ = app.emit("download-progress", 0.0_f64);
-
-        if let Some(parent) = model.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| format!("Failed to create models dir: {}", e))?;
-        }
-
-        let bytes = download_bytes(&app, &model_info.url, "model").await?;
-        tokio::fs::write(&model, &bytes)
-            .await
-            .map_err(|e| format!("Failed to save model: {}", e))?;
+    if needs_model {
+        download_to_file(&app, &model_info.url, "model", &model, model_range).await?;
     }
 
     // --- Download whisper-cli.exe and whisper-server.exe (~4MB zip) ---
-    if !cli.exists() || !server.exists() {
-        let _ = app.emit("download-progress", 92.0_f64);
-
+    if needs_binaries {
         let bin_dir = data_dir().join("bin");
         tokio::fs::create_dir_all(&bin_dir)
             .await
             .map_err(|e| format!("Failed to create bin dir: {}", e))?;
 
-        let zip_bytes = download_bytes(&app, WHISPER_CLI_ZIP_URL, "whisper-cli").await?;
+        let zip_bytes =
+            download_bytes(&app, WHISPER_CLI_ZIP_URL, "whisper-cli", binaries_range).await?;
 
         // Extract .exe and .dll files from the zip in a single pass
         let cursor = Cursor::new(zip_bytes);
@@ -396,8 +551,7 @@ pub async fn download_model(app: tauri::AppHandle, model_id: &str) -> Result<(),
                 let mut buf = Vec::new();
                 file.read_to_end(&mut buf)
                     .map_err(|e| format!("Failed to read {} from zip: {}", file_name, e))?;
-                std::fs::write(&dest, &buf)
-                    .map_err(|e| format!("Failed to write {}: {}", file_name, e))?;
+                write_file_atomically(&dest, &buf)?;
 
                 if file_name == "whisper-cli.exe" {
                     found_cli = true;
@@ -419,7 +573,7 @@ pub async fn download_model(app: tauri::AppHandle, model_id: &str) -> Result<(),
         }
     }
 
-    let _ = app.emit("download-progress", 100.0_f64);
+    emit_progress(&app, 100.0);
     Ok(())
 }
 
@@ -728,8 +882,8 @@ async fn transcribe_partial_cli(
     let _ = tokio::fs::remove_file(&wav_path).await;
 
     if !output.status.success() {
-        // For partial, just return empty on error (don't break the UI)
-        return Ok(String::new());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("whisper-cli failed: {}", stderr.trim()));
     }
 
     let text = String::from_utf8_lossy(&output.stdout);
@@ -888,7 +1042,7 @@ pub async fn download_zipformer(app: tauri::AppHandle) -> Result<(), String> {
     let sherpa_cli = sherpa_cli_path();
 
     if is_zipformer_ready() {
-        let _ = app.emit("download-progress", 100.0_f64);
+        emit_progress(&app, 100.0);
         return Ok(());
     }
 
@@ -912,36 +1066,41 @@ pub async fn download_zipformer(app: tauri::AppHandle) -> Result<(), String> {
         (&model_info.tokens_url, "tokens.txt"),
     ];
 
-    let total_files = files.len() + 1; // +1 for sherpa-onnx CLI
+    // Split the bar into one slice per step (four model files + the sherpa CLI)
+    // so progress only ever moves forward, including over files we skip.
+    let total_steps = files.len() + 1;
+    let slice = 100.0 / total_steps as f64;
+
     for (i, (url, filename)) in files.iter().enumerate() {
         let dest = model_dir.join(filename);
+        let range = ProgressRange::new(i as f64 * slice, (i + 1) as f64 * slice);
         let needs_download = !dest.exists()
             || (*filename == "tokens.txt" && !valid_zipformer_tokens(&dest));
         if needs_download {
-            let base_progress = (i as f64 / total_files as f64) * 100.0;
-            let _ = app.emit("download-progress", base_progress);
-
-            let bytes = download_bytes(&app, url, filename).await?;
-            tokio::fs::write(&dest, &bytes)
-                .await
-                .map_err(|e| format!("Failed to save {}: {}", filename, e))?;
+            download_to_file(&app, url, filename, &dest, range).await?;
+        } else {
+            emit_progress(&app, range.at(1.0));
         }
     }
 
     // Download sherpa-onnx shared library package (contains CLI binary + DLLs)
     if !sherpa_cli.exists() {
-        let base_progress = (files.len() as f64 / total_files as f64) * 100.0;
-        let _ = app.emit("download-progress", base_progress);
+        // Leave the last few percent for extracting and copying the DLLs.
+        let archive_range = ProgressRange::new(files.len() as f64 * slice, 96.0);
 
         // Download tar.bz2 to temp
         let temp_dir = std::env::temp_dir();
         let archive_path = temp_dir.join("sherpa-onnx-package.tar.bz2");
         let extract_dir = temp_dir.join("sherpa-onnx-extract");
 
-        let bytes = download_bytes(&app, SHERPA_ONNX_PACKAGE_URL, "sherpa-onnx").await?;
-        tokio::fs::write(&archive_path, &bytes)
-            .await
-            .map_err(|e| format!("Failed to save sherpa-onnx archive: {}", e))?;
+        download_to_file(
+            &app,
+            SHERPA_ONNX_PACKAGE_URL,
+            "sherpa-onnx",
+            &archive_path,
+            archive_range,
+        )
+        .await?;
 
         // Extract using system tar (available on Windows 10+)
         let _ = tokio::fs::remove_dir_all(&extract_dir).await;
@@ -1021,7 +1180,7 @@ pub async fn download_zipformer(app: tauri::AppHandle) -> Result<(), String> {
         let _ = tokio::fs::remove_dir_all(&extract_dir).await;
     }
 
-    let _ = app.emit("download-progress", 100.0_f64);
+    emit_progress(&app, 100.0);
     Ok(())
 }
 
